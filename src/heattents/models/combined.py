@@ -39,7 +39,16 @@ def crps_samples(samples: np.ndarray, y: np.ndarray) -> np.ndarray:
     return term1 - 0.5 * term2
 
 
-def forecast(paths: Paths = PATHS, seed: int = 7) -> pd.DataFrame:
+def fixed_share_method(train: pd.DataFrame, test: pd.DataFrame) -> pd.DataFrame:
+    """Same share every day: each neighbourhood's share of all earlier calls. Returns (date x uhf) shares."""
+    share = historical_share(train)
+    dates = np.sort(test.date.unique())
+    return pd.DataFrame(np.tile(share.to_numpy(), (len(dates), 1)), index=pd.DatetimeIndex(dates), columns=share.index)
+
+
+def forecast(paths: Paths = PATHS, seed: int = 7, share_method=fixed_share_method) -> pd.DataFrame:
+    """``share_method(train_rows, test_rows)`` returns a (date x neighbourhood) table of shares summing to 1 per day;
+    the same seed gives every method identical citywide samples, so methods differ only in their shares."""
     rng = np.random.default_rng(seed)
     ctx = Context.load(paths)
     C = ctx.city
@@ -54,15 +63,15 @@ def forecast(paths: Paths = PATHS, seed: int = 7) -> pd.DataFrame:
         rows = C[(C.year == s).to_numpy()]
         ft, _ = decision_features(ctx, rows, rng)
         dates, mean_city, Pm = model.pmf(ft, "ens")
-        Ptr = P[P.year < s]
-        share = historical_share(Ptr)
+        Ptr, Pte = P[P.year < s], P[P.year == s]
+        shares = share_method(Ptr, Pte)
         m = Ptr.y.sum() / C[tr].city_y.sum()  # calls with a known neighbourhood / all calls
         past_avg = Ptr.groupby("uhf").y.mean()
-        uhfs = share.index.to_numpy()
-        p = (m * share).to_numpy()
+        uhfs = shares.columns.to_numpy()
         cdf = np.cumsum(Pm, 1)
-        actual = P[P.year == s].pivot_table(index="date", columns="uhf", values="y").reindex(index=dates, columns=uhfs)
+        actual = Pte.pivot_table(index="date", columns="uhf", values="y").reindex(index=dates, columns=uhfs)
         for di, d in enumerate(dates):
+            p = m * shares.loc[d, uhfs].to_numpy()
             N = np.searchsorted(cdf[di], rng.random(N_SAMPLES)).clip(0, cdf.shape[1] - 1)
             Y = rng.binomial(N[None, :], p[:, None])  # (neighbourhoods, samples)
             yb = rng.poisson(past_avg.reindex(uhfs).to_numpy()[:, None], (len(uhfs), N_SAMPLES))
