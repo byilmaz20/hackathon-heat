@@ -4,9 +4,8 @@ Steps, in pipeline order (``all`` runs ingest -> features -> city -> area):
     ingest     download every raw input into data/raw (cached; Open-Meteo has a daily quota, re-run to resume)
     features   static area table, citywide daily series, area x day panel (data/processed)
     eda        exploratory analysis of the label (outputs/eda)
-    city       citywide probabilistic model: rolling-origin evaluation + final models per information set
+    city       citywide model: 2024-26 season-by-season test, final model, heat curve and effects (outputs/models/city)
     area       area share model: rolling-origin evaluation + final model
-    decisions  decision-focused evaluation of forecasts through the Gurobi deployment model
     app        print how to start the Streamlit decision-support app
 """
 from __future__ import annotations
@@ -16,7 +15,7 @@ import time
 
 from .config import PATHS
 
-STEPS = ["ingest", "features", "eda", "city", "area", "decisions", "app"]
+STEPS = ["ingest", "features", "eda", "city", "area", "app"]
 
 
 def ingest(refresh: bool = False):
@@ -55,14 +54,12 @@ def main(argv=None):
             from . import eda
             eda.main() if hasattr(eda, "main") else eda.run()
         elif step == "city":
-            from .models import city
+            from .models import city, explain
             city.evaluate(PATHS)
+            explain.run(PATHS)
         elif step == "area":
             from .models import area
             area.run(PATHS)
-        elif step == "decisions":
-            from . import evaluate_decisions
-            evaluate_decisions.main() if hasattr(evaluate_decisions, "main") else evaluate_decisions.run()
         elif step == "app":
             print("Start the decision-support app with:\n    .venv/bin/streamlit run app/streamlit_app.py")
         print(f"=== {step} done in {time.time() - t0:.0f}s")

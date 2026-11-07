@@ -63,7 +63,6 @@ def build_city(paths: Paths = PATHS) -> pd.DataFrame:
     ed = context.syndromic(paths).set_index("date").heat_ed_visits
     city["ed_visits"] = city.date.map(ed)
     city["ed_visits_l1"] = city.date.map(ed.shift(1, freq="D"))
-    city["censored_peak"] = (city.city_y >= 150).astype(int)
     city.to_parquet(paths.processed / "city_daily.parquet", index=False)
     print(f"[features:city] {len(city)} days, {city.city_y.sum():,.0f} calls -> {paths.processed / 'city_daily.parquet'}")
     return city

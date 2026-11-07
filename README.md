@@ -24,12 +24,11 @@ models learn directly from 17,688 geocoded NYC EMS heat calls (2005–2026).
 
 | | Result |
 |---|---|
-| **Citywide forecast** | Out-of-sample (2022–26), the model beats climatology by **37–57%** and a temperature-only GLM by **16–31%** in CRPS, under every information set (observed weather, real 1-day and 3-day-ahead forecasts). It wins in all 7 test seasons. |
-| **Calibration** | 90% intervals cover 97–98% of days; PIT histograms are close to flat. Predictions correlate **0.84–0.90** with an *independent* label (citywide syndromic heat ED visits). |
-| **Record day** | 2 July 2026 had 231 calls. The 1-day-ahead forecast was 199, out of sample. |
+| **Citywide forecast** | Forecast at 18:00 for the next day, tested out of sample on 2024–26 (450 days). Median daily error 1 call, mean 3.3; correlation with actual 0.93. CRPS is 22% lower than a temperature-only model and 58% lower than climatology. Full documentation: [docs/city_model.md](docs/city_model.md). |
+| **Calibration** | 90% prediction intervals contain the actual count on 96% of days. Forecasts correlate **0.89** with an *independent* label (citywide heat ED visits). |
+| **Busiest days** | 6 of the 8 test days with ≥ 50 calls were flagged the evening before. On 2 July 2026 (231 calls) the forecast was 211. |
 | **Where** | The spatial pattern is extremely stable (area rank correlation 0.94 between 2005–15 and 2016–26) and is driven by *daytime presence* (Times Square, Penn Station, Coney Island), not by resident vulnerability (correlation with HVI: 0.005). Weather moves *how many* calls happen far more than *where*. |
 | **Decision** | 10 tents and 22 doctors on 2 July 2026 reach **~20%** of the day's expected cases within a 1 km walk. Capacity is not the bottleneck on that day; reach is. The Gurobi model solves to <1% gap in ~1 minute. |
-| **Value of forecasting** | See [Decision-focused evaluation](#decision-focused-evaluation). |
 
 ---
 
@@ -42,9 +41,8 @@ brew install libomp                      # macOS only: OpenMP runtime for LightG
 
 .venv/bin/heattents ingest              # download all inputs (cached; Open-Meteo has a daily quota, re-run to resume)
 .venv/bin/heattents features            # area table, citywide series, area × day panel
-.venv/bin/heattents city                # citywide model: rolling-origin evaluation + final models   (~70 s)
+.venv/bin/heattents city                # citywide model: 2024-26 evaluation, final model, heat curve  (~3 min)
 .venv/bin/heattents area                # area share model: evaluation + final model                 (~3 min)
-.venv/bin/heattents decisions           # decision-focused evaluation through Gurobi
 .venv/bin/streamlit run app/streamlit_app.py
 .venv/bin/pytest
 ```
@@ -61,11 +59,10 @@ src/heattents/
   deploy/        model.py (request/plan dataclasses), milp.py (Gurobi), candidates.py
   service.py     "a day" -> forecasts, maps and optimiser input (used by the app and the evaluation)
   eda.py         exploratory analysis of the label
-  evaluate_decisions.py   decision-focused evaluation
   cli.py
 app/             Streamlit decision-support app (data_layer.py is its only access to models and solver)
 data/raw/        downloaded inputs          data/processed/  features
-outputs/         eda/, models/city/, models/area/, decision_eval/
+outputs/         eda/, models/city/, models/area/
 tests/           GLM/spline/conformal, city model, deployment MILP
 archive/london_v1/   the earlier London prototype (superseded)
 ```
@@ -104,46 +101,23 @@ Context indicators published for neighbourhoods (NTA, UHF) are moved to MODZCTA 
 
 ### 1. Citywide probabilistic forecast ([models/city.py](src/heattents/models/city.py))
 
-The daily citywide count $N_t$ follows a negative binomial with a distributed-lag non-linear model (DLNM), the
-standard in heat–health epidemiology:
+**Full documentation, with every input, parameter, the pipeline, all metrics and references: [docs/city_model.md](docs/city_model.md).**
 
-$$
-N_t \sim \mathrm{NB2}(\mu_t, \alpha),\qquad
-\log \mu_t = \underbrace{\textstyle\sum_{l=0}^{3} \mathbf b(T^{app}_{t-l})^\top \mathbf C\, \mathbf q(l)}_{\text{cross-basis}}
-+ \beta_1 \mathrm{EHF}_t + \beta_2\,\text{streak}_t + \beta_3\,\text{season heat}_t + \beta_4\,\text{tropical night}_t
-+ \beta_5 (\Delta^{SW}_{t-1})^+ + \text{calendar} + s(\text{year}) + s(\text{day of year}) \,[+\ \gamma \log(1+N_{t-1})]
-$$
+In short:
+- **When:** at 18:00 on day *d−1* the model forecasts the distribution of tomorrow's citywide heat EMS calls.
+- **Inputs:** tomorrow's archived weather forecast; the last three days' observed weather; heatwave indicators (EHF, hot-day streak); the south-west upstream heat gradient; calls before 18:00 yesterday; calendar.
+- **Models:** the average of a negative binomial regression with a distributed-lag heat term (33 coefficients) and a monotone LightGBM.
+- **Weather uncertainty:** 30 Monte-Carlo draws from real analog forecast errors.
+- **Test:** trained on all earlier summers and tested season by season on 2024, 2025 and 2026.
 
-- $\mathbf b(\cdot)$ is a natural cubic spline in the maximum apparent temperature (knots 26/31/35 °C), and $\mathbf q(l)$ is a quadratic lag basis over 0–3 days.
-- **EHF** is the Excess Heat Factor (Nairn & Fawcett): heat relative to both climatology and the previous 30 days.
-- $\Delta^{SW}$ is the **upstream gradient**: yesterday's apparent max in Philadelphia, Baltimore and DC minus NYC, i.e. heat on its way.
-- The lagged count is used only when it is known (1-day-ahead mode).
+| Model | CRPS ↓ | Mean abs. error | 90% coverage |
+|---|---|---|---|
+| **Ensemble (used)** | **2.32** | **3.32** | 0.96 |
+| Temperature only | 2.97 | 4.37 | 0.90 |
+| Persistence | 4.02 | 5.68 | 0.86 |
+| Climatology | 5.48 | 6.75 | 0.94 |
 
-A monotone-constrained **LightGBM** (Poisson) uses the same features. The **ensemble** averages the two means: the GLM extrapolates to record heat, while the GBM fits ordinary days better.
-
-**Information sets.** Every forecast is built only from what was known when it would have been issued:
-
-| Mode | Target day weather | Earlier days |
-|---|---|---|
-| observed | observed (hindcast ceiling) | observed |
-| lead1 | archived 1-day-ahead forecast | observed; yesterday's calls known |
-| lead3 | archived 3-day-ahead forecast | days d−1, d−2 also forecast; upstream signal as of d−3 |
-
-**Uncertainty.** The predictive distribution is a mixture of NBs over 30 Monte-Carlo weather draws, built by resampling *real* archived forecast errors (test season held out). Split-conformal PIT recalibration (Kuleshov et al., 2018) was implemented. It did **not** improve CRPS out of sample, because the raw model is already calibrated and older seasons are non-stationary, so it is off by default.
-
-**Out-of-sample results**, rolling origin with each season trained on all earlier ones, mean over 2022–26 ([metrics_summary_2022_2026.csv](outputs/models/city/metrics_summary_2022_2026.csv)):
-
-| Mode | Model | CRPS | twCRPS (≥50) | Log score | 90% coverage | Corr. with ED |
-|---|---|---|---|---|---|---|
-| observed | **ensemble** | **1.87** | **0.39** | −1.93 | 0.97 | 0.90 |
-| observed | temperature-only GLM | 2.69 | 0.67 | −3.51 | 0.81 | 0.83 |
-| lead1 | **LightGBM** | **2.53** | **0.58** | −2.06 | 0.97 | 0.89 |
-| lead1 | persistence | 3.24 | 0.60 | −3.43 | 0.87 | 0.79 |
-| lead3 | **ensemble** | **2.79** | **0.72** | −2.07 | 0.98 | 0.84 |
-| lead3 | persistence | 5.30 | 1.28 | −3.00 | 0.84 | 0.29 |
-| any | climatology | 4.39 | 0.96 | −2.54 | 0.95 | 0.37 |
-
-Models are selected by the threshold-weighted CRPS on days ≥ 50 calls, because those are the days that drive decisions.
+![Heat curve](outputs/models/city/heat_curve.png)
 
 ### 2. Area share model ([models/area.py](src/heattents/models/area.py))
 
@@ -224,15 +198,9 @@ $$
 - KPIs report both the distance-weighted objective and the **unweighted expected cases treated**.
 
 The **app** ([app/](app/)) runs exactly this pipeline:
-1. Pick a historical date under an information set, or type a scenario (heat index, day in the spell, weekend/holiday, upstream signal, yesterday's calls).
+1. Pick a historical date (2024–26, forecast as issued the evening before), or type a scenario (heat index, day in the spell, weekend/holiday, upstream signal, yesterday's calls before 18:00).
 2. See the citywide forecast with intervals and a per-area risk map by shift.
 3. Enter tents, doctors and shifts, and let Gurobi return the plan, the roster and the unserved map.
-
----
-
-## Decision-focused evaluation
-
-_Results of `heattents decisions` (outputs/decision_eval/) are added here._
 
 ---
 

@@ -1,14 +1,11 @@
-"""Population and vulnerability by ZCTA (US Census ACS 5-year), and park land (NYC Parks Properties).
+"""Population by ZCTA and year (US Census ACS 5-year), and park land (NYC Parks Properties).
 
-ACS variables (aggregated to MODZCTA in the feature step):
-    pop_total            B01003_001E
-    pop_65plus           sum of B01001 age-sex cells 65+ (male 020-025, female 044-049)
-    households           B11007_001E
-    hh_65plus_alone      B11007_003E  one-person households aged 65+
-    median_income        B19013_001E
-    black_nh, hispanic   B03002_004E, B03002_012E (components of the NYC Heat Vulnerability Index)
-    disability_pct       S1810_C03_001E
-    poverty_pct          S1701_C03_001E
+ACS 5-year estimates by ZIP code tabulation area exist from 2011. The estimate labelled year Y covers the survey years
+Y-4..Y; we use it as the population of year Y. Variables:
+    pop_total    B01003_001E
+    pop_65plus   sum of the B01001 age-sex cells aged 65+ (male 020-025, female 044-049)
+Needs a free Census API key in the CENSUS_API_KEY environment variable (https://api.census.gov/data/key_signup.html).
+2011-2019 must be requested within a state (in=state:36); from 2020 ZCTAs are not nested in states.
 """
 from __future__ import annotations
 
@@ -22,44 +19,43 @@ from ..config import PATHS, Paths
 from .geography import _to_km, load_modzcta
 from .http import get, get_json
 
-ACS_YEAR = 2022
-DETAIL = {"B01003_001E": "pop_total", "B11007_001E": "households", "B11007_003E": "hh_65plus_alone",
-          "B19013_001E": "median_income", "B03002_001E": "pop_race_base", "B03002_004E": "black_nh", "B03002_012E": "hispanic"}
+ACS_YEARS = range(2011, 2025)
 AGE65 = [f"B01001_{i:03d}E" for i in list(range(20, 26)) + list(range(44, 50))]
-SUBJECT = {"S1810_C03_001E": "disability_pct", "S1701_C03_001E": "poverty_pct"}
 ZCTA = "zip code tabulation area"
 
 
-def _acs(table_url: str, variables: list[str]) -> pd.DataFrame:
-    params = {"get": ",".join(variables), "for": f"{ZCTA}:*"}
-    if os.environ.get("CENSUS_API_KEY"):
-        params["key"] = os.environ["CENSUS_API_KEY"]
-    rows = get_json(table_url, params, timeout=300)
-    df = pd.DataFrame(rows[1:], columns=rows[0])
-    return df.rename(columns={ZCTA: "zcta"})
+def _acs_year(year: int, variables: list[str]) -> pd.DataFrame:
+    params = {"get": ",".join(variables), "for": f"{ZCTA}:*", "key": os.environ["CENSUS_API_KEY"]}
+    if year <= 2019:
+        params["in"] = "state:36"
+    rows = get_json(f"https://api.census.gov/data/{year}/acs/acs5", params, timeout=300)
+    return pd.DataFrame(rows[1:], columns=rows[0]).rename(columns={ZCTA: "zcta"})
 
 
 def acs(paths: Paths = PATHS, refresh: bool = False) -> pd.DataFrame | None:
-    """Needs a free Census API key in the CENSUS_API_KEY environment variable; returns None without one."""
-    out = paths.raw / f"acs{ACS_YEAR}_zcta_nyc.csv"
+    """Long table zcta, year, pop_total, pop_65plus for NYC ZCTAs; None without a Census key."""
+    out = paths.raw / "acs5_zcta_nyc_by_year.csv"
     if out.exists() and not refresh:
         return pd.read_csv(out, dtype={"zcta": str})
     if not os.environ.get("CENSUS_API_KEY"):
         print("[ingest:acs] skipped - set CENSUS_API_KEY (free: https://api.census.gov/data/key_signup.html)")
         return None
     nyc = {z for zs in load_modzcta(paths).zips for z in zs}
-    base = f"https://api.census.gov/data/{ACS_YEAR}/acs/acs5"
-    d = _acs(base, list(DETAIL) + AGE65)
-    s = _acs(base + "/subject", list(SUBJECT))
-    df = d.merge(s, on="zcta", how="left")
-    df = df[df.zcta.isin(nyc)].copy()
-    num = [c for c in df.columns if c != "zcta"]
-    df[num] = df[num].apply(pd.to_numeric, errors="coerce")
-    df[df[num] < -1e5] = None  # Census missing-value sentinels (-666666666 etc.)
-    df["pop_65plus"] = df[AGE65].sum(axis=1)
-    df = df.drop(columns=AGE65).rename(columns={**DETAIL, **SUBJECT})
+    frames = []
+    for year in ACS_YEARS:
+        try:
+            d = _acs_year(year, ["B01003_001E"] + AGE65)
+        except Exception as err:  # year not yet published
+            print(f"[ingest:acs] {year}: unavailable ({err})")
+            continue
+        d = d[d.zcta.isin(nyc)].copy()
+        num = ["B01003_001E"] + AGE65
+        d[num] = d[num].apply(pd.to_numeric, errors="coerce").where(lambda v: v >= 0)  # negative = Census missing code
+        frames.append(pd.DataFrame({"zcta": d.zcta, "year": year, "pop_total": d.B01003_001E,
+                                    "pop_65plus": d[AGE65].sum(axis=1, min_count=1)}))
+    df = pd.concat(frames, ignore_index=True)
     df.to_csv(out, index=False)
-    print(f"[ingest:acs] {len(df)} NYC ZCTAs -> {out}")
+    print(f"[ingest:acs] {df.zcta.nunique()} NYC ZCTAs x {df.year.nunique()} years ({df.year.min()}-{df.year.max()}) -> {out}")
     return df
 
 
