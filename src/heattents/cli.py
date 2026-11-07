@@ -1,0 +1,72 @@
+"""Command line:  heattents <step>   (or python -m heattents <step>)
+
+Steps, in pipeline order (``all`` runs ingest -> features -> city -> area):
+    ingest     download every raw input into data/raw (cached; Open-Meteo has a daily quota, re-run to resume)
+    features   static area table, citywide daily series, area x day panel (data/processed)
+    eda        exploratory analysis of the label (outputs/eda)
+    city       citywide probabilistic model: rolling-origin evaluation + final models per information set
+    area       area share model: rolling-origin evaluation + final model
+    decisions  decision-focused evaluation of forecasts through the Gurobi deployment model
+    app        print how to start the Streamlit decision-support app
+"""
+from __future__ import annotations
+
+import argparse
+import time
+
+from .config import PATHS
+
+STEPS = ["ingest", "features", "eda", "city", "area", "decisions", "app"]
+
+
+def ingest(refresh: bool = False):
+    from .ingest import activity, context, demographics, ems, geography, weather
+    ems.fetch(PATHS, refresh)
+    geography.load_modzcta(PATHS, refresh)
+    for kind in ("NTA2010", "UHF42", "CD"):
+        geography.load_polygons(kind, PATHS, refresh)
+    context.indicators(PATHS, refresh)
+    context.syndromic(PATHS, refresh)
+    context.hvi(PATHS, refresh)
+    context.cooling_sites(PATHS, refresh)
+    activity.jobs(PATHS, refresh)
+    activity.subway(PATHS, refresh)
+    demographics.park_share(PATHS, refresh)
+    demographics.acs(PATHS, refresh)  # optional, needs CENSUS_API_KEY
+    weather.fetch_all(PATHS, refresh)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="heattents", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("step", choices=STEPS + ["all"])
+    ap.add_argument("--refresh", action="store_true", help="re-download raw inputs")
+    args = ap.parse_args(argv)
+    steps = ["ingest", "features", "city", "area"] if args.step == "all" else [args.step]
+    for step in steps:
+        t0 = time.time()
+        print(f"=== {step}")
+        if step == "ingest":
+            ingest(args.refresh)
+        elif step == "features":
+            from .features import panel, static
+            static.build(PATHS)
+            panel.build(PATHS)
+        elif step == "eda":
+            from . import eda
+            eda.main() if hasattr(eda, "main") else eda.run()
+        elif step == "city":
+            from .models import city
+            city.evaluate(PATHS)
+        elif step == "area":
+            from .models import area
+            area.run(PATHS)
+        elif step == "decisions":
+            from . import evaluate_decisions
+            evaluate_decisions.main() if hasattr(evaluate_decisions, "main") else evaluate_decisions.run()
+        elif step == "app":
+            print("Start the decision-support app with:\n    .venv/bin/streamlit run app/streamlit_app.py")
+        print(f"=== {step} done in {time.time() - t0:.0f}s")
+
+
+if __name__ == "__main__":
+    main()

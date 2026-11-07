@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heattents"
+version = "2.0.0"
+description = "Probabilistic heat-illness forecasting and daily cooling-tent & doctor deployment for New York City"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "pandas>=2.1", "pyarrow>=15", "shapely>=2.0", "lightgbm>=4.3", "gurobipy>=12.0", "streamlit>=1.35", "pydeck>=0.9"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+heattents = "heattents.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

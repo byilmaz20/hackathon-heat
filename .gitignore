@@ -1,0 +1,14 @@
+# Environment / tooling
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.idea/
+.DS_Store
+.~lock*
+*.log
+
+# Data and generated artifacts (managed in the DB, not in git)
+data/
+archive/
+outputs/
