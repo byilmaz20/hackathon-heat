@@ -97,6 +97,28 @@ def load_polygons(kind: str, paths: Paths = PATHS, refresh: bool = False) -> pd.
     return pd.DataFrame(rows)
 
 
+UHF_BOROUGH = {"1": "BRONX", "2": "BROOKLYN", "3": "MANHATTAN", "4": "QUEENS", "5": "RICHMOND / STATEN ISLAND"}
+
+
+def load_neighbourhoods(paths: Paths = PATHS) -> pd.DataFrame:
+    """The 42 United Hospital Fund (UHF42) neighbourhoods of the NYC Health Department: uhf code, name, borough
+    (EMS spelling, from the code's first digit), representative point, area and geometry."""
+    U = load_polygons("UHF42", paths)
+    U = U[U.geo_id != "9999"].reset_index(drop=True)
+    pts = [g.representative_point() for g in U.geometry]
+    return pd.DataFrame({"uhf": U.geo_id, "name": [p["GEONAME"] for p in U.props],
+                         "borough": U.geo_id.str[0].map(UHF_BOROUGH), "lat": [p.y for p in pts],
+                         "lon": [p.x for p in pts], "area_km2": [_to_km(g).area for g in U.geometry],
+                         "geometry": U.geometry})
+
+
+def modzcta_to_neighbourhood(paths: Paths = PATHS) -> pd.Series:
+    """MODZCTA -> UHF42 code (NYC Health Department ZIP crosswalk; every MODZCTA lies in exactly one neighbourhood)."""
+    x = pd.read_csv(paths.raw / "ehdp_zcta_to_uhf.csv", dtype=str)
+    x = x[x.uhfcode != "9999"].drop_duplicates("zcta")
+    return pd.Series(x.uhfcode.to_numpy(), index=x.zcta.to_numpy(), name="uhf")
+
+
 def area_weights(Z: pd.DataFrame, polys: pd.DataFrame) -> pd.DataFrame:
     """Long table (modzcta, geo_id, weight): share of each MODZCTA's area lying in each polygon."""
     zk = [_to_km(g) for g in Z.geometry]

@@ -69,13 +69,13 @@ def f_to_c(f: float) -> float:
     return (f - 32) * 5 / 9
 
 
-def get_forecast(sc: Scenario, n_scenarios: int = 10, seed: int = 0):
+def get_forecast(sc: Scenario, seed: int = 0):
     """DayForecast: city predictive summary + samples, per-area map values, and Gurobi demand scenarios."""
     svc = service()
     if sc.date is not None:
-        return svc.forecast_date(sc.date, n_scenarios=n_scenarios, seed=seed)
+        return svc.forecast_date(sc.date, seed=seed)
     d = pd.Timestamp("2026-07-15")
-    return svc.simulate(n_scenarios=n_scenarios, seed=seed, atmax=f_to_c(sc.heat_index_f),
+    return svc.simulate(seed=seed, atmax=f_to_c(sc.heat_index_f),
                         hot_days_before=int(sc.hot_days_before), season_hot_days_before=max(int(sc.hot_days_before), 8),
                         weekend=int(sc.weekend), holiday=int(sc.holiday), up_sw_gradient=sc.upstream_gradient_f * 5 / 9,
                         calls_by18=float(sc.calls_yesterday_by18), event=sc.event, year=2026, day_of_year=int(d.day_of_year), date=d)

@@ -1,5 +1,10 @@
 r"""Demand scenarios for the deployment optimiser: coherent city -> area -> hour samples.
 
+PREDICTION OUTPUT (for the daily optimiser): neighbourhood_demand() - daily expected calls per UHF neighbourhood
+in each of 5 equally likely scenarios (scenario_table; the 10th/30th/50th/70th/90th percentiles of the city model's
+predictive distribution), with D^s_u = N^s * m * pi_u.
+
+Legacy hourly ZIP-area demand (build_demand, used by the current app's optimiser until it is replaced):
 For scenario s on day t:
     N^s_t      ~ citywide predictive distribution (city model; NB + conformal / forecast-error uncertainty)
     D^s_{i,h}  = N^s_t * m * pi_{it} * phi_{b(i), weekend(t), h}
@@ -80,6 +85,20 @@ def build_demand(area_rows: pd.DataFrame, totals: np.ndarray, area_model: Contex
     return D[["area_id", "lat", "lon", "hour", "scenario", "expected_cases"]]
 
 
+def neighbourhood_demand(nb: pd.DataFrame, totals: np.ndarray, mapped_fraction: float) -> pd.DataFrame:
+    """THE PREDICTION OUTPUT used by the optimiser: daily demand per neighbourhood and scenario,
+        D^s_u = N^s * m * pi_u        (no hour split: decisions are daily)
+    N^s the scenario's citywide total (stratified_totals), m the share of calls with a known location, pi_u the
+    neighbourhood's share from the beach & event share model.
+    nb: one row per neighbourhood with columns [uhf, share] (shares sum to 1); totals: the 5 scenario totals.
+    Output columns: [uhf, scenario, probability, expected_cases]; 42 x 5 = 210 rows; sums to N^s * m per scenario."""
+    share = nb.share.to_numpy()
+    p = 1 / len(totals)
+    out = [pd.DataFrame({"uhf": nb.uhf.to_numpy(), "scenario": s, "probability": p,
+                         "expected_cases": N * mapped_fraction * share}) for s, N in enumerate(totals)]
+    return pd.concat(out, ignore_index=True)
+
+
 def mapped_fraction(paths: Paths = PATHS) -> float:
     e = load_ems(paths)
     return float(e.modzcta.notna().mean())
@@ -90,10 +109,28 @@ def area_rows_for_date(date, paths: Paths = PATHS) -> pd.DataFrame:
     return prepare(P)
 
 
-def stratified_totals(samples: np.ndarray, k: int) -> np.ndarray:
-    """k equally weighted representative totals: the (i + 0.5) / k quantiles of the predictive samples.
+# The prediction output always has exactly these 5 equally likely scenarios of tomorrow's citywide total.
+N_SCENARIOS = 5
+SCENARIO_QUANTILES = (0.1, 0.3, 0.5, 0.7, 0.9)  # = (i + 0.5) / 5
+SCENARIO_PROBABILITY = 1 / N_SCENARIOS  # 0.2 each
+SCENARIO_LABELS = ("quiet", "below average", "middle", "above average", "busy")
 
-    Scenarios differ only in the citywide level (the spatial-temporal pattern is shared), so stratified
-    quantiles are a low-variance substitute for k i.i.d. draws in the sample-average approximation.
+
+def stratified_totals(samples: np.ndarray, k: int = N_SCENARIOS) -> np.ndarray:
+    """k equally weighted representative totals: the (i + 0.5) / k quantiles of the predictive samples
+    (k = 5: the 10th, 30th, 50th, 70th and 90th percentiles).
+
+    Each scenario stands for one fifth of the predictive distribution (the 0-20%, 20-40%, ... band), so the five
+    together are a low-variance substitute for i.i.d. draws in the sample-average approximation. Scenarios differ
+    only in the citywide level; the split across areas (the shares) is the same in all of them.
     """
     return np.quantile(np.asarray(samples, float), (np.arange(k) + 0.5) / k)
+
+
+def scenario_table(samples: np.ndarray, mapped_fraction: float) -> pd.DataFrame:
+    """The 5 scenarios of tomorrow: scenario id, label, percentile, citywide total, total with a known location,
+    probability."""
+    totals = stratified_totals(samples, N_SCENARIOS)
+    return pd.DataFrame({"scenario": np.arange(N_SCENARIOS), "label": SCENARIO_LABELS,
+                         "percentile": [round(100 * q) for q in SCENARIO_QUANTILES], "city_total": totals,
+                         "located_total": totals * mapped_fraction, "probability": SCENARIO_PROBABILITY})

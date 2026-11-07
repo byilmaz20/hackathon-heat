@@ -1,7 +1,7 @@
 # Forecasting model: how many heat calls tomorrow, and where
 
 **Question.** At 18:00 on day *d−1*, how many heat-related EMS calls will New York City have on day *d*, and how will
-they be spread over the city's 177 ZIP areas?
+they be spread over the city's 42 neighbourhoods?
 
 **Answer.** Two models in sequence:
 
@@ -9,16 +9,16 @@ they be spread over the city's 177 ZIP areas?
 2. **Beach & event share model**: where they land. Each ZIP area's share of tomorrow's calls.
 
 Expected calls in area *i* = city forecast × *m* × share of *i*, where *m* = 0.96 is the share of calls that have a
-known location. The hour-of-day profile then turns this into demand scenarios for the Gurobi tent-and-doctor
-optimiser.
+known location. The share model works on the 177 ZIP areas; their shares add up exactly to the **42 UHF
+neighbourhoods**, which is the unit handed to the optimiser.
 
 ```
 18:00 on d-1
  weather forecast for d ─┐
  last 3 days' weather ───┼─► CITY MODEL ──► P(total calls on d)  ──┐
  upstream heat, calendar ┤   GLM + LightGBM, 30 weather draws      │
- calls before 18:00 ─────┘                                         ├─► expected calls per area ─► hour profile ─► Gurobi
-                                                                   │   (city total × 0.96 × share)
+ calls before 18:00 ─────┘   5 scenarios: 10/30/50/70/90th pct     ├─► daily calls per neighbourhood ─► daily MILP
+                                                                   │   × 5 scenarios (city total × 0.96 × share)
  weekend / holiday ──────┐                                         │
  beach season, heat band ┼─► SHARE MODEL ──► share of each area ───┘
  event calendar ─────────┘   Poisson-multinomial GLM
@@ -27,6 +27,61 @@ optimiser.
 Code: [city.py](../src/heattents/models/city.py), [context_share.py](../src/heattents/models/context_share.py),
 [scenarios.py](../src/heattents/models/scenarios.py), [service.py](../src/heattents/service.py).
 Full technical documentation of the city model: [city_model.md](city_model.md).
+
+---
+
+## Output: what the forecast hands to the optimiser
+
+Every evening the forecast produces **one table of daily demand: 42 neighbourhoods × 5 scenarios = 210 rows.** There
+is no hourly split; decisions are made for the whole day.
+
+**The 5 scenarios** are five equally likely versions of tomorrow's citywide total, from quiet to busy. They are the
+10th, 30th, 50th, 70th and 90th percentiles of the city model's forecast distribution. Each stands for one fifth of that
+distribution, so each has probability 0.2. The split across neighbourhoods is the same in all five; only the city
+total changes. The spread comes from two sources: tomorrow's weather (30 draws of the weather forecast with real past
+forecast errors) and day-to-day randomness in the number of calls.
+
+$$
+D^s_u = N^s \cdot m \cdot \pi_u, \qquad s = 0,\dots,4,\quad u = 1,\dots,42,\quad P(s) = 0.2
+$$
+
+- $N^s$: scenario *s*'s citywide total
+- $m = 0.96$: share of calls with a known location
+- $\pi_u$: the neighbourhood's share from the share model
+
+**Scenario table** (`DayForecast.scenarios`; example 2 July 2026):
+
+| scenario | label | percentile | city_total | located_total | probability |
+|---|---|---|---|---|---|
+| 0 | quiet | 10 | 134.0 | 129.1 | 0.2 |
+| 1 | below average | 30 | 210.0 | 202.3 | 0.2 |
+| 2 | middle | 50 | 272.0 | 262.0 | 0.2 |
+| 3 | above average | 70 | 354.0 | 341.0 | 0.2 |
+| 4 | busy | 90 | 488.1 | 470.1 | 0.2 |
+
+**Demand table** (`DayForecast.demand_neighbourhood`, built by `neighbourhood_demand()` in
+[scenarios.py](../src/heattents/models/scenarios.py)):
+
+| Column | Meaning |
+|---|---|
+| `uhf` | UHF42 neighbourhood code (e.g. `306` = Chelsea – Clinton) |
+| `scenario` | 0–4, as in the scenario table |
+| `probability` | 0.2 |
+| `expected_cases` | Expected heat EMS calls with a known location in that neighbourhood that day, in that scenario |
+
+Example rows for Chelsea – Clinton (share 7.8%): 10.1 / 15.8 / 20.5 / 26.7 / 36.8 expected calls in scenarios 0–4.
+In every scenario the 42 rows sum to that scenario's `located_total`.
+
+**Neighbourhood summary** (`DayForecast.neighbourhoods`, for maps and reports): one row per neighbourhood with name,
+borough, today's share, usual share, change against a usual day, expected calls, 90% range of calls, probability of
+at least one call, and observed calls for past dates.
+
+**Units:** expected **EMS heat calls** (the label), not all heat illness. Calls without a usable location (about 4%) are
+in the city total but not in any neighbourhood.
+
+**How to get it:** `ForecastService().forecast_date("2026-07-02")` for a past date (forecast as issued the evening
+before), or `ForecastService().simulate(...)` for a what-if day. Both return a `DayForecast` with `scenarios` and
+`demand_neighbourhood`. The number of scenarios is fixed (`N_SCENARIOS = 5`).
 
 ---
 
@@ -242,7 +297,7 @@ Measured on a 10-core Apple Silicon laptop, CPU only.
 | Share model: one fit (7,788 cells) | 0.3 s |
 | Share model: fit with ridge tuning (5 fits) | 1.7 s |
 | Share model: `heattents area` (7-summer backtest + final model) | 14 s |
-| **Daily forecast, one evening:** city model (30 weather draws) + shares + 5 demand scenarios for the optimiser (46,244 rows) | **0.15 s** |
+| **Daily forecast, one evening:** city model (30 weather draws) + shares + the 5-scenario neighbourhood demand table | **0.15 s** |
 | … of which the share model | 0.02 s |
 | First forecast after start-up (loads models and data) | 0.9 s |
 

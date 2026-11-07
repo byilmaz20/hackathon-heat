@@ -66,8 +66,8 @@ def sidebar_scenario() -> dl.Scenario:
 
 
 @st.cache_data(show_spinner="Running the forecast models...")
-def cached_forecast(sc: dl.Scenario, n_scenarios: int):
-    return dl.get_forecast(sc, n_scenarios=n_scenarios)
+def cached_forecast(sc: dl.Scenario):
+    return dl.get_forecast(sc)
 
 
 def forecast_page(sc: dl.Scenario, fc):
@@ -184,9 +184,9 @@ def deploy_page(sc: dl.Scenario, fc):
 
 
 sc = sidebar_scenario()
-n_sc = st.sidebar.slider("Forecast scenarios for the optimiser", 3, 20, 5,
-                         help="Stratified quantiles of the citywide predictive distribution (sample-average approximation).")
-fc = cached_forecast(sc, n_sc)
+fc = cached_forecast(sc)
+st.sidebar.caption("The optimiser plans for 5 equally likely versions of tomorrow: the 10th, 30th, 50th, 70th and "
+                   "90th percentiles of the citywide forecast.")
 st.sidebar.divider()
 st.sidebar.caption("Models: citywide DLNM-NB + LightGBM ensemble with analog forecast-error Monte Carlo; "
                    "area shares by the beach & event share model (weekend/holiday, beach season, event calendar); "

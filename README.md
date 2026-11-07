@@ -10,8 +10,8 @@ This project answers that question end to end, from public data:
 EMS heat calls (label) ─┐
 weather + forecasts ────┼─► [1] citywide probabilistic forecast ──┐
 upstream cities ────────┘     (DLNM-NB + LightGBM, forecast-error MC)│
-                                                                      ├─► [3] coherent demand scenarios ─► [4] Gurobi MILP ─► app
-weekend, beach, events ────► [2] beach & event share model ─────────┘     (city × area × hour)        (tents, doctors, shifts)
+                                                                      ├─► [3] daily demand: 42 neighbourhoods × 5 scenarios ─► [4] Gurobi MILP ─► app
+weekend, beach, events ────► [2] beach & event share model ─────────┘     (10/30/50/70/90th percentiles)   (tents, health workers)
 (usual share per ZIP area)
 ```
 
@@ -94,7 +94,7 @@ Context indicators published for neighbourhoods (NTA, UHF) are moved to MODZCTA 
 - **Peaks are censored.** On 2026 peak days EMS was saturated (53% of calls held), so EMS counts under-state true demand on exactly the days that matter.
 - **Not event-driven.** The 2–4 July 2026 peak followed the heat (108 °F), not the US-250th celebrations.
 - **Sparse.** 97.6% of area-days have zero calls. The overdispersion is temporal: the citywide total ranges from 0 to 231.
-- **Stable hour profile.** It peaks at 14:00 and does not depend on temperature.
+- **Stable hour profile.** Calls peak at 14:00, with 62% between 12:00 and 18:00. On very hot days (≥ 36 °C) they spread a little more into the morning and evening (60% vs 67% on mild days).
 
 ---
 
@@ -157,16 +157,18 @@ tested and not kept, because none beat this model out of sample:
 - neighbourhood temperature (HRRR)
 - direct and panel neighbourhood count models
 
-### 3. Demand scenarios ([models/scenarios.py](src/heattents/models/scenarios.py))
+### 3. Prediction output: daily demand per neighbourhood in 5 scenarios ([models/scenarios.py](src/heattents/models/scenarios.py))
 
 $$
-D^s_{a,h} = N^s_t \cdot m \cdot \pi_{i(a),t}\, w_a \cdot \phi_{b(i),\text{weekend},h}
+D^s_u = N^s \cdot m \cdot \pi_u, \qquad 42 \text{ neighbourhoods} \times 5 \text{ scenarios}, \quad P(s) = 0.2
 $$
 
-- $N^s_t$ are **stratified quantiles** of the predictive distribution (a low-variance SAA design; the scenarios differ in level, not pattern).
-- $m$ is the share of calls with a mappable location.
-- $\phi$ is the empirical hour profile by borough and weekend.
-- Each area's demand is spread over up to four interior points $a$ (weights $w_a$), so that 1 km walking catchments are realistic.
+- $N^s$ are the **10th, 30th, 50th, 70th and 90th percentiles** of the city model's predictive distribution: five equally likely versions of tomorrow, from quiet to busy. Each stands for one fifth of the distribution.
+- $m$ is the share of calls with a known location (0.96).
+- $\pi_u$ is the neighbourhood's share: the share model's 177 ZIP-area shares summed to the 42 UHF neighbourhoods.
+- The output is **daily** (no hourly split) and always has exactly 5 scenarios. Columns: `uhf, scenario, probability, expected_cases`.
+
+Full specification with an example: [docs/forecast_model.md § Output](docs/forecast_model.md#output-what-the-forecast-hands-to-the-optimiser).
 
 ### 4. Daily deployment: two-stage stochastic MILP ([deploy/milp.py](src/heattents/deploy/milp.py))
 
