@@ -1,7 +1,8 @@
 """One entry point from "a day" (historical date or user scenario) to forecasts, maps and Gurobi demand scenarios.
 
     day  ->  city model (predictive distribution of the citywide total, chosen information set)
-         ->  area model (shares pi_it)  ->  hour profile  ->  coherent demand scenarios D^s_{a,h}
+         ->  beach & event share model pi_it (models.context_share)
+         ->  hour profile  ->  coherent demand scenarios D^s_{a,h}
 
 Used by the Streamlit app and by the decision-focused evaluation.
 """
@@ -14,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from .config import PATHS, Paths
-from .models.area import DAILY, AreaModel, prepare
+from .models.context_share import ContextShare, day_context, prepare
 from .models.city import Context, decision_features, load_city_model
 from .models.scenarios import build_demand, hour_profile, mapped_fraction, stratified_totals
 
@@ -26,7 +27,7 @@ class DayForecast:
     label: str
     city: pd.Series  # mean, q05..q95, p_ge50, p_ge100
     samples: np.ndarray  # predictive samples of the citywide total
-    areas: pd.DataFrame  # modzcta, share, expected (mean total x share x mapped fraction), p_ge1, borough
+    areas: pd.DataFrame  # modzcta, borough, share, usual_share, change_vs_usual, expected, p_ge1
     demand: pd.DataFrame  # Gurobi input: area_id, lat, lon, hour, scenario, expected_cases
     observed_total: float | None = None
     observed_areas: pd.Series | None = None
@@ -41,8 +42,12 @@ class ForecastService:
         return Context.load(self.paths)
 
     @cached_property
-    def area_model(self) -> AreaModel:
-        return AreaModel.load(self.paths.out("models/area") / "area_model.txt")
+    def area_model(self) -> ContextShare:
+        """Beach & event share model (models.context_share); train it with `heattents area`."""
+        path = self.paths.out("models/share") / "share_model.pkl"
+        if not path.exists():
+            raise FileNotFoundError(f"{path} missing: run `heattents area` to train the share model")
+        return ContextShare.load(path)
 
     @cached_property
     def profile(self) -> pd.DataFrame:
@@ -72,6 +77,10 @@ class ForecastService:
         exp_total = float(pred["mean"])
         areas = pd.DataFrame({"modzcta": rows.modzcta.to_numpy(), "borough": rows.borough.to_numpy(), "share": shares,
                               "expected": exp_total * shares * self.mapped})
+        usual = getattr(self.area_model, "usual", None)
+        if usual is not None:  # how today's map differs from the long-run map (1.0 = usual share)
+            areas["usual_share"] = areas.modzcta.map(dict(zip(self.area_model.areas, usual))).to_numpy()
+            areas["change_vs_usual"] = areas.share / areas.usual_share
         # P(at least one call in the area) under the predictive mixture of totals (Poisson thinning)
         areas["p_ge1"] = 1 - np.exp(-np.outer(samples, shares * self.mapped)).mean(0)
         totals = stratified_totals(samples, n_scenarios)
@@ -87,26 +96,23 @@ class ForecastService:
         if row.empty:
             raise ValueError(f"{date.date()} is not in the modelled season (May-Sep 2005-2026)")
         f, _ = decision_features(self.ctx, row, rng, self.n_draws)
+        rows = self.area_rows(date)
+        rows["atmax"] = float(self.ctx.fc.atmax.get(date, rows.atmax.iloc[0]))  # heat known at 18:00: the forecast
         return self._finish(f"{date.date()} (forecast issued 18:00 the day before)", self.city_model, f,
-                            self.area_rows(date), n_scenarios, n_samples, rng, observed=float(row.city_y.iloc[0]))
+                            rows, n_scenarios, n_samples, rng, observed=float(row.city_y.iloc[0]))
 
     def simulate(self, n_scenarios: int = 5, n_samples: int = 4000, seed: int = 0, lead_error_sd: float = 1.5,
                  **scenario) -> DayForecast:
-        """User scenario, e.g. simulate(atmax=41, hot_days_before=3, weekend=1, up_sw_gradient=2, calls_by18=90)."""
+        """User scenario, e.g. simulate(atmax=41, hot_days_before=3, weekend=1, up_sw_gradient=2, calls_by18=90).
+
+        ``event`` (optional): one of heattents.models.context_share.EVENTS (e.g. "pride") to place on the day."""
         rng = np.random.default_rng(seed)
+        event = scenario.pop("event", None)
         cm = self.city_model
         f = cm.scenario(rng=rng, n_draws=self.n_draws, lead_error_sd=lead_error_sd, **scenario)
         rows = self.area_rows(REFERENCE_DATE)
-        first = f.iloc[0]
-        override = {"atmax": first.atmax, "tmin": first.tmin, "rh": first.rh, "ehf": first.ehf, "streak": first.streak,
-                    "season_hot_days": first.season_hot_days, "weekend": first.weekend, "holiday": first.holiday,
-                    "july4_window": first.july4_window, "school_break": first.school_break, "covid": first.covid,
-                    "year": first.year, "day_of_year": first.day_of_year}
-        for c, v in override.items():
-            if c in DAILY:
-                rows[c] = v
-        # yesterday's borough calls: scale yesterday's citywide count by the borough's historical share
-        y_l1 = (scenario.get("calls_by18") or 0.0) / 0.81  # full-day estimate: 81% of calls arrive before 18:00
-        bshare = rows.groupby("borough").daytime_presence.transform("sum") / rows.daytime_presence.sum()
-        rows["borough_y_l1"] = y_l1 * bshare
+        first = f.iloc[0]  # the share model needs only the day type: heat, weekend, holiday (and the event)
+        rows["atmax"], rows["weekend"], rows["holiday"] = first.atmax, first.weekend, first.holiday
+        rows = day_context(rows)
+        rows["event"] = event or "none"
         return self._finish("scenario", cm, f, rows, n_scenarios, n_samples, rng)

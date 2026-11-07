@@ -6,7 +6,7 @@
 expected count, quantiles (5%, 25%, 50%, 75%, 95%) and the probability of ≥ 50 and ≥ 100 calls.
 
 **Code:** [src/heattents/models/city.py](../src/heattents/models/city.py).
-**Run:** `python -m heattents.models.city` (evaluation + final model, ~3 min).
+**Run:** `python -m heattents.models.city` (evaluation + final model, ~5 s).
 
 ---
 
@@ -225,7 +225,7 @@ These are the model's associations with other inputs held fixed, not causal effe
 - **The weather forecast is a single model (GFS via Open-Meteo "best match").** It ran hot on peak days in July 2024.
   ECMWF or a multi-model mean may be better; this is untested.
 - **Few extreme days.** There are only 8 test days with ≥ 50 calls, so peak-day statistics are uncertain.
-- **Citywide only.** Where in the city calls happen is a separate model (the area model).
+- **Citywide only.** Where in the city calls happen is a separate model (the beach & event share model, [forecast_model.md](forecast_model.md)).
 - **Season only.** May–September; 97.7% of heat calls fall in these months.
 
 ---

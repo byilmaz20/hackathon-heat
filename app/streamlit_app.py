@@ -18,6 +18,7 @@ st.set_page_config(page_title="NYC Heat Response", layout="wide")
 SHIFT_BANDS = {"Whole day (0-24)": list(range(24)), "Morning (8-14)": list(range(8, 14)),
                "Afternoon (12-18)": list(range(12, 18)), "Evening (18-24)": list(range(18, 24))}
 DEFAULT_SHIFTS = pd.DataFrame({"name": ["morning", "afternoon", "evening"], "start_hour": [8, 12, 16], "end_hour": [14, 18, 22]})
+EVENT_NAMES = ["pride", "puerto_rican_day", "dominican_day", "west_indian_day", "mermaid_parade", "us_open"]
 VIEW = pdk.ViewState(latitude=40.71, longitude=-73.94, zoom=9.6, pitch=0)
 
 
@@ -54,11 +55,14 @@ def sidebar_scenario() -> dl.Scenario:
     hot = st.sidebar.slider("Hot days (heat index ≥ 90°F) already in this spell", 0, 7, 2)
     wk = st.sidebar.checkbox("Weekend")
     hol = st.sidebar.checkbox("Public holiday")
+    event = st.sidebar.selectbox("Permitted event today", ["none", *EVENT_NAMES],
+                                 help="Recurring parades / venues with a known route; they shift where calls happen.")
     up = st.sidebar.slider("Upstream signal: yesterday's heat index in Philadelphia/Baltimore/DC minus NYC (°F)", -10, 10, 0,
                            help="Positive = hotter air mass on its way from the south-west.")
     y1 = st.sidebar.number_input("Heat EMS calls yesterday before 18:00 (citywide)", 0, 400, 30)
     return dl.Scenario(label=f"scenario: {hi}°F heat index, day {hot + 1} of spell", heat_index_f=hi,
-                       hot_days_before=hot, weekend=wk, holiday=hol, upstream_gradient_f=up, calls_yesterday_by18=float(y1))
+                       hot_days_before=hot, weekend=wk, holiday=hol, upstream_gradient_f=up, calls_yesterday_by18=float(y1),
+                       event=None if event == "none" else event)
 
 
 @st.cache_data(show_spinner="Running the forecast models...")
@@ -88,6 +92,16 @@ def forecast_page(sc: dl.Scenario, fc):
         expected="mean", low="min", high="max")
     st.caption("City-wide expected cases by hour (mean, and the lowest / highest of the representative forecast scenarios)")
     st.line_chart(hourly)
+    if "change_vs_usual" in fc.areas:
+        chg = fc.areas.set_index("modzcta").change_vs_usual
+        per_area = per_area.assign(vs_usual=per_area.area_id.map(chg))
+        moved = fc.areas[(fc.areas.change_vs_usual - 1).abs() >= 0.25].sort_values("change_vs_usual", ascending=False)
+        st.markdown("**How today's map differs from a usual day** (share of the city's calls vs the long-run share)")
+        if moved.empty:
+            st.caption("An ordinary day: no area's share moves by 25% or more. The calls follow the usual pattern.")
+        else:
+            st.dataframe(moved.assign(change_vs_usual=lambda d: (d.change_vs_usual - 1).map("{:+.0%}".format))
+                         [["modzcta", "borough", "change_vs_usual", "expected"]].round(2), width="stretch", hide_index=True)
     top = per_area.sort_values("expected", ascending=False).head(15)
     if fc.observed_areas is not None:
         top = top.assign(observed=top.area_id.map(fc.observed_areas))
@@ -175,7 +189,8 @@ n_sc = st.sidebar.slider("Forecast scenarios for the optimiser", 3, 20, 5,
 fc = cached_forecast(sc, n_sc)
 st.sidebar.divider()
 st.sidebar.caption("Models: citywide DLNM-NB + LightGBM ensemble with analog forecast-error Monte Carlo; "
-                   "area shares by LightGBM; Gurobi two-stage stochastic MILP.")
+                   "area shares by the beach & event share model (weekend/holiday, beach season, event calendar); "
+                   "Gurobi two-stage stochastic MILP.")
 page = st.sidebar.radio("Screen", ["Forecast / simulation", "Deploy"])
 st.title("NYC heat-illness response")
 if page == "Forecast / simulation":

@@ -3,7 +3,8 @@ r"""Demand scenarios for the deployment optimiser: coherent city -> area -> hour
 For scenario s on day t:
     N^s_t      ~ citywide predictive distribution (city model; NB + conformal / forecast-error uncertainty)
     D^s_{i,h}  = N^s_t * m * pi_{it} * phi_{b(i), weekend(t), h}
-pi_{it}  area shares (area model), m = share of calls with a mappable location (calibrated on history),
+pi_{it}  area shares (beach & event share model, models.context_share)
+m        share of calls with a mappable location (calibrated on history)
 phi      hour-of-day profile by borough and weekend (empirical; the EDA shows it does not depend on temperature).
 Each area's demand is spread over a few points inside its polygon so that walking catchments are realistic.
 Output columns match heattents.deploy: [area_id, lat, lon, hour, scenario, expected_cases].
@@ -19,7 +20,7 @@ from shapely.geometry import Point
 from ..config import PATHS, Paths
 from ..features.panel import load_ems
 from ..ingest.geography import load_modzcta
-from .area import AreaModel, prepare
+from .context_share import ContextShare, prepare
 
 
 def hour_profile(paths: Paths = PATHS, smoothing: float = 5.0) -> pd.DataFrame:
@@ -55,7 +56,7 @@ def demand_points(points_per_area: int = 4) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_demand(area_rows: pd.DataFrame, totals: np.ndarray, area_model: AreaModel, profile: pd.DataFrame,
+def build_demand(area_rows: pd.DataFrame, totals: np.ndarray, area_model: ContextShare, profile: pd.DataFrame,
                  mapped_fraction: float, points_per_area: int = 4, min_cases: float = 1e-3) -> pd.DataFrame:
     """area_rows: one day's panel rows (all 177 areas, incl. borough & weekend); totals: (n_scenarios,) city totals."""
     shares = area_model.shares(area_rows)

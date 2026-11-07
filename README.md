@@ -11,8 +11,8 @@ EMS heat calls (label) ─┐
 weather + forecasts ────┼─► [1] citywide probabilistic forecast ──┐
 upstream cities ────────┘     (DLNM-NB + LightGBM, forecast-error MC)│
                                                                       ├─► [3] coherent demand scenarios ─► [4] Gurobi MILP ─► app
-area features ──────────────► [2] area share model (LightGBM) ───────┘     (city × area × hour)        (tents, doctors, shifts)
-(presence, heat, green, vulnerability)
+weekend, beach, events ────► [2] beach & event share model ─────────┘     (city × area × hour)        (tents, doctors, shifts)
+(usual share per ZIP area)
 ```
 
 The label is **where and when heat-illness emergencies actually happened**, so no disaggregation is needed: the
@@ -27,7 +27,7 @@ models learn directly from 17,688 geocoded NYC EMS heat calls (2005–2026).
 | **Citywide forecast** | Forecast at 18:00 for the next day, tested out of sample on 2024–26 (450 days). Median daily error 1 call, mean 3.3; correlation with actual 0.93. CRPS is 22% lower than a temperature-only model and 58% lower than climatology. Full documentation: [docs/city_model.md](docs/city_model.md). |
 | **Calibration** | 90% prediction intervals contain the actual count on 96% of days. Forecasts correlate **0.89** with an *independent* label (citywide heat ED visits). |
 | **Busiest days** | 6 of the 8 test days with ≥ 50 calls were flagged the evening before. On 2 July 2026 (231 calls) the forecast was 211. |
-| **Where** | The spatial pattern is extremely stable (area rank correlation 0.94 between 2005–15 and 2016–26) and is driven by *daytime presence* (Times Square, Penn Station, Coney Island), not by resident vulnerability (correlation with HVI: 0.005). Weather moves *how many* calls happen far more than *where*. |
+| **Where** | The usual map is stable (area rank correlation 0.94 between 2005–15 and 2016–26) and is driven by *daytime presence*, not resident vulnerability. The beach & event share model moves it where the data supports a move: weekends/holidays, beach season and permitted events (+0.11 nats/call on event days, with calibrated moves). Heat moves *how many* calls, not *where*. |
 | **Decision** | 10 tents and 22 doctors on 2 July 2026 reach **~20%** of the day's expected cases within a 1 km walk. Capacity is not the bottleneck on that day; reach is. The Gurobi model solves to <1% gap in ~1 minute. |
 
 ---
@@ -41,8 +41,8 @@ brew install libomp                      # macOS only: OpenMP runtime for LightG
 
 .venv/bin/heattents ingest              # download all inputs (cached; Open-Meteo has a daily quota, re-run to resume)
 .venv/bin/heattents features            # area table, citywide series, area × day panel
-.venv/bin/heattents city                # citywide model: 2024-26 evaluation, final model, heat curve  (~3 min)
-.venv/bin/heattents area                # area share model: evaluation + final model                 (~3 min)
+.venv/bin/heattents city                # citywide model: 2024-26 evaluation, final model, heat curve  (~5 s)
+.venv/bin/heattents area                # share model: 2018-26 evaluation + final model               (~15 s)
 .venv/bin/streamlit run app/streamlit_app.py
 .venv/bin/pytest
 ```
@@ -55,14 +55,15 @@ Optional: set `CENSUS_API_KEY` (free) to add ACS 65+ and disability shares to th
 src/heattents/
   ingest/        downloaders, one module per source (ems, geography, context, weather, activity, demographics)
   features/      static area table, heat features, calendar, area × day panel
-  models/        glm.py (IRLS, splines, DLNM cross-basis), city.py, area.py, scenarios.py
+  models/        glm.py (IRLS, splines, DLNM cross-basis), city.py, context_share.py (share model), scenarios.py,
+                 explain.py, diagnostics.py
   deploy/        model.py (request/plan dataclasses), milp.py (Gurobi), candidates.py
   service.py     "a day" -> forecasts, maps and optimiser input (used by the app and the evaluation)
   eda.py         exploratory analysis of the label
   cli.py
 app/             Streamlit decision-support app (data_layer.py is its only access to models and solver)
 data/raw/        downloaded inputs          data/processed/  features
-outputs/         eda/, models/city/, models/area/
+outputs/         eda/, models/city/, models/share/
 tests/           GLM/spline/conformal, city model, deployment MILP
 archive/london_v1/   the earlier London prototype (superseded)
 ```
@@ -119,32 +120,42 @@ In short:
 
 ![Heat curve](outputs/models/city/heat_curve.png)
 
-### 2. Area share model ([models/area.py](src/heattents/models/area.py))
+### 2. Beach & event share model ([models/context_share.py](src/heattents/models/context_share.py))
 
-Given the city total, calls are allocated multinomially, $y_{it}\mid N_t \sim \mathrm{Mult}(N_t, \pi_t)$, with
-$\pi_{it} \propto \exp g(x_i, w_t)$. This is fitted as a Poisson LightGBM with offset $\log N_t$ (the Poisson–multinomial equivalence).
+**Full documentation of both forecasting models (inputs, parameters, pipeline, runtimes, why GLM + LightGBM): [docs/forecast_model.md](docs/forecast_model.md).**
 
-- $x_i$ are area features: daytime presence (residents + jobs + subway entries), density, surface temperature, vegetation, tree canopy, parks, poverty, older adults living alone, HVI, plus the area id.
-- $w_t$ is the day's heat and calendar.
+The city model gives *how many* calls; this model gives each of the 177 ZIP areas' *share* of them. Every area has a
+usual share (it follows daytime presence and barely changes between years). The model changes it only on days the
+evening-before information says are different:
 
-At forecast time the shares multiply the citywide predictive distribution. This is *top-down reconciliation with forecast proportions* (Athanasopoulos, Ahmed & Hyndman, 2009): area forecasts always sum to the city forecast.
+- **Weekends and holidays:** beach and park areas gain; office districts lose.
+- **Beach season:** beach areas ×1.6, ×1.5 more on weekends.
+- **Recurring events on their routes:** Pride ×6.1, Puerto Rican Day ×4.1, West Indian Day ×15.9, Dominican Day, Mermaid Parade, US Open.
 
-Out-of-sample, mean over seasons 2018–2026 ([area_scores_summary.csv](outputs/models/area/area_scores_summary.csv)):
+$$
+\log \pi_{i,d} = a_i + c(d) + \sum_k \beta_k Z_{ik}\,\text{leisure}_d + \text{beach}_i\,\text{open}_d\,(g_1 + g_2\,\text{leisure}_d + g_3\,\text{heat}_d + g_4\,\text{leisure}_d\text{heat}_d) + \sum_e \gamma_e\,\mathbb 1[e \text{ on } d]\,\text{route}_{ie} + u_i\,\text{leisure}_d
+$$
 
-| Allocation | Log-likelihood per call | Calls in predicted top-10% areas |
-|---|---|---|
-| LightGBM share model | −4.901 | 27.4% |
-| Historical share | −4.903 | 27.4% |
-| Daytime presence share | −5.027 | 20.6% |
-| Resident population share | −5.173 | 13.9% |
-| *Oracle: the test season's own realised shares (not a forecast)* | *−4.793* | *30.4%* |
+- **Fitting:** a Poisson–multinomial GLM (380 parameters) fitted by penalised IRLS. Recent summers are weighted more (half-life 8 years).
+- **Speed:** the 594k area-days collapse exactly to 7,788 cells, so one fit takes 0.3 s.
+- **Heat is not used to move the map** (except at beaches): hot days bring more calls from the same places.
 
-The oracle shows how little room there is: even knowing the season's realised map, only 30% of calls fall in the
-top-10% areas, because individual calls are Poisson noise around a stable pattern. The model reaches ~90% of
-that ceiling. It matches the historical map and clearly beats population-based allocation. **Daytime presence is
-a much better exposure measure than residence.** The honest conclusion: the *where* is persistent, and the predictable
-signal is in the *when / how many*. That is why the deployment decision depends mostly on the citywide forecast and on
-reach.
+Out of sample, 2018–26 ([outputs/models/share/](outputs/models/share/)):
+
+| | Result |
+|---|---|
+| Log-likelihood gain over the historical map | +0.013 nats per call; **+0.111 on event days**; +0.032 on weekends |
+| Predicted moves come true | forecast ×3.00 → observed ×3.23 for the largest rises; ×0.53 → ×0.62 for the largest drops |
+| Daily ratio error, ZIP level (0 = identical maps) | 0.819, against 0.824 for the historical map and 0.817 for a perfect model |
+
+Most day-to-day scatter between areas is chance: within a summer it is no larger than a multinomial draw, and recent
+local calls do not predict tomorrow's. So on an ordinary weekday the forecast is the usual map. Alternatives were
+tested and not kept, because none beat this model out of sample:
+
+- a LightGBM share model
+- heat × vulnerability terms
+- neighbourhood temperature (HRRR)
+- direct and panel neighbourhood count models
 
 ### 3. Demand scenarios ([models/scenarios.py](src/heattents/models/scenarios.py))
 
@@ -208,6 +219,6 @@ The **app** ([app/](app/)) runs exactly this pipeline:
 
 - EMS calls are a proxy for heat illness. Peak days are censored by EMS saturation, and calls without a location (3.7%) count only towards the city total.
 - "Treated at a tent" means a case occurring within walking distance that tent capacity can absorb. The medical effect of a visit, and people's willingness to walk (the decay parameter), are assumptions.
-- The area model is trained on where calls were *made*; a deployed tent may itself shift behaviour.
+- The share model is trained on where calls were *made*; a deployed tent may itself shift behaviour.
 - Within-city weather differences come from static surface-temperature data. Daily borough ERA5-Land series are supported but were not available within the Open-Meteo quota at build time.
 - The deployment model is solved for one day; multi-day planning (moving tents, crew fatigue) is not modelled.

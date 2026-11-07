@@ -1,7 +1,7 @@
 """Single data-access layer of the app.
 
 get_forecast(scenario)   -> heattents.service.DayForecast from the trained models: citywide predictive distribution
-                            (DLNM-NB / LightGBM ensemble, forecast-error Monte Carlo), area shares (LightGBM),
+                            (DLNM-NB / LightGBM ensemble, forecast-error Monte Carlo), area shares (beach & event share model),
                             hour profile, and coherent demand scenarios for the optimiser.
 candidate_sites(...)     -> NYC Parks properties screened by reachable demand (or Cool It! NYC sites).
 solver_backend()         -> heattents.deploy.milp (Gurobi) if importable, else app/mock.py (greedy).
@@ -37,6 +37,7 @@ class Scenario:
     holiday: bool = False
     upstream_gradient_f: float = 0.0  # custom: yesterday's heat index in Philadelphia/Baltimore/DC minus NYC (F)
     calls_yesterday_by18: float = 30.0  # custom: yesterday's citywide heat EMS calls before 18:00
+    event: str | None = None  # custom: recurring permitted event on the day (see heattents.models.context_share.EVENTS)
 
 
 # --- static data ----------------------------------------------------------------------------------------------
@@ -77,7 +78,7 @@ def get_forecast(sc: Scenario, n_scenarios: int = 10, seed: int = 0):
     return svc.simulate(n_scenarios=n_scenarios, seed=seed, atmax=f_to_c(sc.heat_index_f),
                         hot_days_before=int(sc.hot_days_before), season_hot_days_before=max(int(sc.hot_days_before), 8),
                         weekend=int(sc.weekend), holiday=int(sc.holiday), up_sw_gradient=sc.upstream_gradient_f * 5 / 9,
-                        calls_by18=float(sc.calls_yesterday_by18), year=2026, day_of_year=int(d.day_of_year), date=d)
+                        calls_by18=float(sc.calls_yesterday_by18), event=sc.event, year=2026, day_of_year=int(d.day_of_year), date=d)
 
 
 def area_of(area_id: pd.Series) -> pd.Series:
