@@ -14,7 +14,15 @@ import streamlit as st
 
 import data_layer as dl
 
-st.set_page_config(page_title="NYC Heat Response", layout="wide")
+st.set_page_config(page_title="NYC Heat Response", layout="wide", initial_sidebar_state="expanded")
+# presentation mode: keep only the sidebar open/close arrow from Streamlit's top bar (menu, Deploy and the
+# running indicator are hidden) and trim the empty space above the title
+st.html("""<style>
+header[data-testid="stHeader"] {background: transparent; height: 2.6rem;}
+[data-testid="stMainMenu"], [data-testid="stAppDeployButton"], [data-testid="stStatusWidget"],
+[data-testid="stToolbarActions"], [data-testid="stDecoration"] {display: none !important;}
+.block-container {padding-top: 2.4rem;}
+</style>""")
 
 # chart colours (categorical, validated for colour-blind separation and contrast on the dark surface)
 MODEL_COLORS = {"GLM": "#3987e5", "GBM": "#d95926", "Ensemble": "#199e70"}
@@ -276,9 +284,12 @@ def predictive_page():
     acc = dl.city_accuracy()
     with b.container(border=True):
         st.markdown("**Accuracy** · 2024-26, out of sample")
+        big = ("<div style='font-size:1.8rem;font-weight:600;line-height:1.1'>{}</div>"
+               "<div style='opacity:.7;font-size:.85rem;margin-bottom:8px'>{}</div>")
         k1, k2 = st.columns(2)
-        big = "<div style='font-size:2rem;font-weight:600;line-height:1.1'>{}</div><div style='opacity:.7'>{}</div>"
-        k1.markdown(big.format(f"{acc['median_error']:,.0f}", "people: typical daily error"), unsafe_allow_html=True)
+        k1.markdown(big.format(f"{acc['median_error']:,.0f}", f"people: typical error on an average day "
+                                                               f"(~{acc['avg_people']:,.0f} need help)"),
+                    unsafe_allow_html=True)
         k2.markdown(big.format(f"{acc['in_range_pct']:.0f}%",
                                "of days the actual number fell inside the forecast's likely range"),
                     unsafe_allow_html=True)
@@ -317,8 +328,8 @@ def milp_page():
         st.latex(r"x_j \in \{0,1\}, \quad 0 \le u_a \le 1")
     with c.container(border=True):
         st.markdown("**Decision variables**")
-        st.markdown("- $x_j$ = 1 if a field hospital opens at site $j$\n- $u_a$ = share of people at point $a$ "
-                    "who are within reach")
+        st.markdown("- $x_j$ = 1 if a field hospital opens at site $j$ (0 otherwise)\n- $u_a$ = 1 if point $a$ is "
+                    "within reach of an open hospital (0 otherwise)")
         st.markdown("**Parameters**")
         st.markdown(
             "- $a$: demand points, up to 4 inside each ZIP area (708)\n"
@@ -333,25 +344,26 @@ def milp_page():
 
 PLAN_LABELS = {"population": "Population rule", "vulnerability (HVI)": "Heat-vulnerability rule",
                "forecast + MILP": "Forecast + MILP", "hindsight (upper bound)": "Best possible"}
+# our plan in the ensemble green; the other plans in neutral grey
+PLAN_COLORS = {"population": "#a8a69e", "vulnerability (HVI)": "#a8a69e", "forecast + MILP": MODEL_COLORS["Ensemble"],
+               "hindsight (upper bound)": "#a8a69e"}
 DAY_LABELS = {"2024-06-21": "Fri 21 Jun 2024 · heatwave", "2025-06-29": "Sun 29 Jun 2025 · Pride"}
 
 
 def results_bars(R: pd.DataFrame) -> alt.Chart:
     order = list(PLAN_LABELS.values())
     R = R[R.plan.isin(PLAN_LABELS)]
-    R = R.assign(label=R.plan.map(PLAN_LABELS), kind=np.where(R.plan == "forecast + MILP", "ours",
-                                                              np.where(R.plan.str.startswith("hindsight"), "best", "rule")))
-    color = alt.Color("kind:N", legend=None, scale=alt.Scale(domain=["rule", "ours", "best"],
-                                                             range=[OBSERVED_COLOR, MODEL_COLORS["Ensemble"], "#7d7b74"]))
-    y = alt.Y("label:N", title=None, sort=order,
+    R = R.assign(label=R.plan.map(PLAN_LABELS))
+    color = alt.Color("label:N", legend=None, scale=alt.Scale(domain=order, range=[PLAN_COLORS[p] for p in PLAN_LABELS]))
+    y = alt.Y("label:N", title=None, sort=order, scale=alt.Scale(paddingInner=0.18, paddingOuter=0.05),
               axis=alt.Axis(labelLimit=0, labelOverlap=False, labelFontSize=12, labelPadding=6, ticks=False))
-    bars = alt.Chart(R).mark_bar(cornerRadiusEnd=4, height=18).encode(
+    bars = alt.Chart(R).mark_bar(cornerRadiusEnd=4).encode(
         x=alt.X("helped:Q", title="People helped", axis=alt.Axis(grid=False)), y=y, color=color,
         tooltip=[alt.Tooltip("label:N", title="Plan"), alt.Tooltip("helped:Q", title="Helped", format=",.0f"),
                  alt.Tooltip("helped_pct:Q", title="% of people needing help", format=".0f")])
     text = alt.Chart(R.assign(t=[f"{h:,.0f} ({p:.0f}%)" for h, p in zip(R.helped, R.helped_pct)])).mark_text(
         align="left", dx=4, fontSize=11, color="#888").encode(x="helped:Q", y=y, text="t:N")
-    return (bars + text).properties(height=36 * len(R))
+    return (bars + text).properties(height=34 * len(R))
 
 
 def results_map(date: str, plan: str) -> pdk.Deck:

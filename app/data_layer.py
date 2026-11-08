@@ -146,6 +146,9 @@ APP_OUT = ROOT / "outputs" / "app"
 COVERAGE_OUT = ROOT / "outputs" / "models" / "deploy_compare" / "coverage"
 
 
+HEATWAVE_C = 35.0  # forecast max heat index >= 95 F, the deployment days of deploy.compare
+
+
 @lru_cache(maxsize=1)
 def city_accuracy() -> dict:
     """Out-of-sample accuracy of the citywide ensemble, 2024-26, in people."""
@@ -153,7 +156,10 @@ def city_accuracy() -> dict:
     E = E[E.model == "ens"]
     err = (E.y - E["mean"]).abs() * PEOPLE_PER_CALL
     top = E.nlargest(8, "y")
+    hot = E.date.map(service().ctx.fc.atmax).to_numpy() >= HEATWAVE_C  # forecast heat index: deployment days
     return dict(days=len(E), median_error=float(err.median()), mean_error=float(err.mean()),
+                avg_people=float(E.y.mean() * PEOPLE_PER_CALL), hot_days=int(hot.sum()),
+                hot_median_error=float(err[hot].median()), hot_avg_people=float(E.y[hot].mean() * PEOPLE_PER_CALL),
                 correlation=float(np.corrcoef(E.y, E["mean"])[0, 1]),
                 in_range_pct=float(100 * ((E.y >= E.q05) & (E.y <= E.q95)).mean()),
                 busiest_error={MODEL_LABELS[m]: float(PEOPLE_PER_CALL * (g.set_index("date").loc[top.date, "mean"]
