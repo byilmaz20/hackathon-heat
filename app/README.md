@@ -4,6 +4,16 @@
 .venv/bin/streamlit run app/streamlit_app.py
 ```
 
+**Mock mode (for UI work).** With no `data/`, trained models or Gurobi licence, the app runs on `app/mock_data.py`
+(synthetic NYC geography, forecasts, neighbourhoods and candidate sites in exactly the shapes the real pipeline returns)
+and the greedy solver in `app/mock.py`. It switches on automatically when `outputs/models/share/share_model.pkl` is
+missing; force it with `HEAT_MOCK=1`, or force the real pipeline with `HEAT_MOCK=0`. A sidebar banner shows when it is on.
+
+**Spatial unit: the 42 UHF neighbourhoods.** Maps, tables and the optimiser input all use the prediction output
+`fc.demand_neighbourhood` (42 neighbourhoods x 5 scenarios, daily). `data_layer.neighbourhood_demand` splits it into
+hours with the forecast's citywide hour profile and spreads each neighbourhood's demand evenly over ~10 points inside
+it (`area_id = "uhf#j"`), so walking distances to tents stay meaningful.
+
 The app has two screens, chosen in the sidebar.
 
 ## 1. Forecast / simulation

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import pydeck as pdk
@@ -15,10 +16,12 @@ import data_layer as dl
 
 st.set_page_config(page_title="NYC Heat Response", layout="wide")
 
-SHIFT_BANDS = {"Whole day (0-24)": list(range(24)), "Morning (8-14)": list(range(8, 14)),
-               "Afternoon (12-18)": list(range(12, 18)), "Evening (18-24)": list(range(18, 24))}
+# chart colours (categorical, validated for colour-blind separation and contrast on the dark surface)
+MODEL_COLORS = {"GLM": "#3987e5", "GBM": "#d95926", "Ensemble": "#199e70"}
+OBSERVED_COLOR = "#c3c2b7"
+CHART_HEIGHT = 300
+MAP_LAYER = "neighbourhoods"
 DEFAULT_SHIFTS = pd.DataFrame({"name": ["morning", "afternoon", "evening"], "start_hour": [8, 12, 16], "end_hour": [14, 18, 22]})
-EVENT_NAMES = ["pride", "puerto_rican_day", "dominican_day", "west_indian_day", "mermaid_parade", "us_open"]
 VIEW = pdk.ViewState(latitude=40.71, longitude=-73.94, zoom=9.6, pitch=0)
 
 
@@ -33,36 +36,29 @@ def ramp(v: np.ndarray) -> list[list[int]]:
     return [[int(a), int(b), int(c), 190] for a, b, c in rgb]
 
 
-def choropleth(values: pd.DataFrame, col: str, tooltip_cols: list[str]) -> pdk.Layer:
-    P = dl.area_polygons().merge(values, on="area_id", how="left").fillna({col: 0})
+def choropleth(values: pd.DataFrame, col: str, tooltip_cols: list[str], layer_id: str = MAP_LAYER) -> pdk.Layer:
+    """Colour the 42 neighbourhoods by `col` (values keyed by area_id = uhf code)."""
+    names = dl.neighbourhoods()[["area_id", "name", "borough"]]
+    P = dl.neighbourhood_polygons().merge(names, on="area_id").merge(values, on="area_id", how="left").fillna({col: 0})
     P["fill"] = ramp(P[col].to_numpy(float))
     for c in tooltip_cols:
         if c in P and P[c].dtype.kind == "f":
             P[c] = P[c].round(2)
-    return pdk.Layer("PolygonLayer", P, get_polygon="polygon", get_fill_color="fill", get_line_color=[90, 90, 90, 80],
-                     line_width_min_pixels=0.5, pickable=True, stroked=True)
+    return pdk.Layer("PolygonLayer", P, id=layer_id, get_polygon="polygon", get_fill_color="fill",
+                     get_line_color=[90, 90, 90, 80], line_width_min_pixels=0.5, pickable=True, stroked=True)
 
 
 def sidebar_scenario() -> dl.Scenario:
-    st.sidebar.header("Day to forecast")
-    mode = st.sidebar.radio("Input", ["Historical date", "Custom scenario"], horizontal=True)
+    mode = st.sidebar.radio("Day to forecast", ["Historical date", "Custom scenario"])
     if mode == "Historical date":
         date = st.sidebar.date_input("Date (May-Sep 2024-2026)", dt.date(2026, 7, 2), min_value=dt.date(2024, 5, 1),
                                      max_value=dt.date(2026, 9, 21))
-        st.sidebar.caption("Forecast as issued at 18:00 the evening before, from the archived weather forecast.")
         return dl.Scenario(label=f"{date:%Y-%m-%d} · forecast issued the evening before", date=str(date))
-    hi = st.sidebar.slider("Max heat index today (°F)", 75, 115, 102)
-    hot = st.sidebar.slider("Hot days (heat index ≥ 90°F) already in this spell", 0, 7, 2)
+    hi_c = st.sidebar.slider("Max heat index today (°C)", 24, 46, 39)
     wk = st.sidebar.checkbox("Weekend")
     hol = st.sidebar.checkbox("Public holiday")
-    event = st.sidebar.selectbox("Permitted event today", ["none", *EVENT_NAMES],
-                                 help="Recurring parades / venues with a known route; they shift where calls happen.")
-    up = st.sidebar.slider("Upstream signal: yesterday's heat index in Philadelphia/Baltimore/DC minus NYC (°F)", -10, 10, 0,
-                           help="Positive = hotter air mass on its way from the south-west.")
-    y1 = st.sidebar.number_input("Heat EMS calls yesterday before 18:00 (citywide)", 0, 400, 30)
-    return dl.Scenario(label=f"scenario: {hi}°F heat index, day {hot + 1} of spell", heat_index_f=hi,
-                       hot_days_before=hot, weekend=wk, holiday=hol, upstream_gradient_f=up, calls_yesterday_by18=float(y1),
-                       event=None if event == "none" else event)
+    # everything else keeps the Scenario defaults (day 3 of a hot spell, no upstream signal, no event)
+    return dl.Scenario(label=f"scenario: {hi_c}°C heat index", heat_index_f=hi_c * 9 / 5 + 32, weekend=wk, holiday=hol)
 
 
 @st.cache_data(show_spinner="Running the forecast models...")
@@ -70,45 +66,101 @@ def cached_forecast(sc: dl.Scenario):
     return dl.get_forecast(sc)
 
 
-def forecast_page(sc: dl.Scenario, fc):
+@st.cache_data(show_spinner=False)
+def cached_nb_demand(sc: dl.Scenario) -> pd.DataFrame:
+    """Hourly demand per neighbourhood point and scenario (optimiser input), from the 42-neighbourhood forecast."""
+    return dl.neighbourhood_demand(cached_forecast(sc))
+
+
+def _x(date_format: str = "%d %b") -> alt.X:
+    return alt.X("date:T", title=None, axis=alt.Axis(format=date_format, grid=False))
+
+
+def _date_rule(date: str) -> alt.Chart:
+    """Dashed vertical line on the chosen date."""
+    return alt.Chart(pd.DataFrame({"date": [pd.Timestamp(date)]})).mark_rule(
+        color="#f0efec", strokeDash=[4, 4], strokeWidth=1).encode(x=_x())
+
+
+def history_chart(H: pd.DataFrame, date: str, y_title: str) -> alt.Chart:
+    """Observed (dots) vs ensemble forecast (line, 90% band) day by day around the chosen date."""
+    long = H.melt("date", ["observed", "forecast"], var_name="series", value_name="calls")
+    long["series"] = long.series.map({"observed": "Observed", "forecast": "Forecast (ensemble)"})
+    color = alt.Color("series:N", title=None, legend=alt.Legend(orient="top"),
+                      scale=alt.Scale(domain=["Observed", "Forecast (ensemble)"],
+                                      range=[OBSERVED_COLOR, MODEL_COLORS["Ensemble"]]))
+    x = _x()
+    band = alt.Chart(H).mark_area(opacity=0.18, color=MODEL_COLORS["Ensemble"]).encode(
+        x=x, y=alt.Y("q05:Q", title=y_title), y2="q95:Q")
+    line = alt.Chart(long[long.series != "Observed"]).mark_line(strokeWidth=2).encode(x=x, y="calls:Q", color=color)
+    dots = alt.Chart(long[long.series == "Observed"]).mark_circle(size=45, opacity=1).encode(x=x, y="calls:Q", color=color)
+    hover = alt.selection_point(nearest=True, on="pointerover", fields=["date"], empty=False)
+    hit = alt.Chart(H).mark_rule(strokeWidth=12, opacity=0).encode(
+        x=x, tooltip=[alt.Tooltip("date:T", format="%a %d %b %Y"), alt.Tooltip("observed:Q", title="Observed"),
+                      alt.Tooltip("forecast:Q", title="Forecast", format=".1f"),
+                      alt.Tooltip("q05:Q", title="90% low"), alt.Tooltip("q95:Q", title="90% high")]).add_params(hover)
+    cross = alt.Chart(H).mark_rule(color="#888", strokeWidth=1).encode(x=x).transform_filter(hover)
+    return (band + line + dots + _date_rule(date) + cross + hit).properties(height=CHART_HEIGHT)
+
+
+def models_chart(M: pd.DataFrame, date: str) -> alt.Chart:
+    """Citywide calls: GLM, GBM and ensemble forecasts against the actual count, day by day."""
+    domain = ["Actual", "GLM", "GBM", "Ensemble"]
+    color = alt.Color("series:N", title=None, legend=alt.Legend(orient="top"),
+                      scale=alt.Scale(domain=domain, range=[OBSERVED_COLOR] + [MODEL_COLORS[m] for m in domain[1:]]))
+    x = _x()
+    y = alt.Y("calls:Q", title="Heat EMS calls (city)")
+    lines = alt.Chart(M[M.series != "Actual"]).mark_line(strokeWidth=2).encode(x=x, y=y, color=color)
+    actual = alt.Chart(M[M.series == "Actual"]).mark_line(strokeWidth=1.5, strokeDash=[2, 2],
+                                                          point=alt.OverlayMarkDef(size=45, filled=True)).encode(
+        x=x, y=y, color=color)
+    W = M.pivot(index="date", columns="series", values="calls").reset_index()
+    hover = alt.selection_point(nearest=True, on="pointerover", fields=["date"], empty=False)
+    hit = alt.Chart(W).mark_rule(strokeWidth=12, opacity=0).encode(
+        x=x, tooltip=[alt.Tooltip("date:T", format="%a %d %b %Y")]
+        + [alt.Tooltip(f"{s}:Q", format=".1f") for s in domain if s in W]).add_params(hover)
+    cross = alt.Chart(W).mark_rule(color="#888", strokeWidth=1).encode(x=x).transform_filter(hover)
+    return (lines + actual + _date_rule(date) + cross + hit).properties(height=CHART_HEIGHT)
+
+
+def selected_neighbourhood(event) -> dict | None:
+    """The neighbourhood clicked on the map (area_id, name, borough), if any."""
+    try:
+        objs = event.selection["objects"].get(MAP_LAYER, [])
+    except (AttributeError, KeyError, TypeError):
+        return None
+    return objs[0] if objs else None
+
+
+def forecast_page(sc: dl.Scenario, fc, demand: pd.DataFrame):
     st.subheader(f"Heat-illness forecast · {sc.label}")
-    c = fc.city
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Expected heat EMS calls (city)", f"{c['mean']:.0f}")
-    m2.metric("90% prediction interval", f"{c['q05']:.0f} – {c['q95']:.0f}")
-    m3.metric("P(≥ 100 calls)", f"{100 * c['p_ge100']:.0f}%")
-    m4.metric("Observed that day", "–" if fc.observed_total is None else f"{fc.observed_total:.0f}")
-    c1, c2 = st.columns([1, 1])
-    band = c1.selectbox("Hours", list(SHIFT_BANDS), index=0)
-    k = c2.slider("Risk threshold k (cases in the band, per ZIP area)", 1, 5, 1)
-    per_area = dl.summarise(fc.demand, SHIFT_BANDS[band], k)
-    metric = st.radio("Map", ["Expected cases", f"P(cases ≥ {k})", "Upper 95% bound"], horizontal=True)
-    col = {"Expected cases": "expected", f"P(cases ≥ {k})": f"p_ge_{k}", "Upper 95% bound": "q95"}[metric]
-    layer = choropleth(per_area, col, ["expected", "q05", "q95", f"p_ge_{k}"])
-    st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=VIEW, map_style="light",
-                             tooltip={"text": "ZIP area {area_id}\nexpected {expected}\n90% band {q05}–{q95}\n"
-                                              f"P(≥{k}) {{p_ge_{k}}}"}), width="stretch")
-    hourly = fc.demand.groupby(["hour", "scenario"]).expected_cases.sum().groupby("hour").agg(
-        expected="mean", low="min", high="max")
-    st.caption("City-wide expected cases by hour (mean, and the lowest / highest of the representative forecast scenarios)")
-    st.line_chart(hourly)
-    if "change_vs_usual" in fc.areas:
-        chg = fc.areas.set_index("modzcta").change_vs_usual
-        per_area = per_area.assign(vs_usual=per_area.area_id.map(chg))
-        moved = fc.areas[(fc.areas.change_vs_usual - 1).abs() >= 0.25].sort_values("change_vs_usual", ascending=False)
-        st.markdown("**How today's map differs from a usual day** (share of the city's calls vs the long-run share)")
-        if moved.empty:
-            st.caption("An ordinary day: no area's share moves by 25% or more. The calls follow the usual pattern.")
-        else:
-            st.dataframe(moved.assign(change_vs_usual=lambda d: (d.change_vs_usual - 1).map("{:+.0%}".format))
-                         [["modzcta", "borough", "change_vs_usual", "expected"]].round(2), width="stretch", hide_index=True)
-    top = per_area.sort_values("expected", ascending=False).head(15)
-    if fc.observed_areas is not None:
-        top = top.assign(observed=top.area_id.map(fc.observed_areas))
-    st.dataframe(top.round(3), width="stretch", hide_index=True)
+    st.metric("Expected heat EMS calls (city)", f"{fc.city['mean']:.0f}")
+    per_nb = dl.summarise(demand, list(range(24)))
+    # the map spec must not depend on the selection, or Streamlit resets the selection when it redraws
+    event = st.pydeck_chart(pdk.Deck(layers=[choropleth(per_nb, "expected", ["expected"])], initial_view_state=VIEW,
+                                     map_style="light", tooltip={"text": "{name} ({borough})\nexpected cases {expected}"}),
+                            width="stretch", on_select="rerun", selection_mode="single-object", key="nb_map")
+    chosen = selected_neighbourhood(event)
+    st.caption("Expected heat EMS calls by neighbourhood (whole day, ensemble forecast). "
+               "Click a neighbourhood to see its history; click it again to clear.")
+    if sc.date is None:
+        st.info("Pick a historical date in the sidebar to compare the forecasts with what happened.")
+        return
+    st.markdown("**City: observed vs forecast**")
+    st.altair_chart(history_chart(dl.city_history(sc.date), sc.date, "Heat EMS calls (city)"), width="stretch")
+    if chosen:
+        st.markdown(f"**{chosen['name']}: observed vs forecast**")
+        H = dl.neighbourhood_history(str(chosen["area_id"]), sc.date)
+        st.altair_chart(history_chart(H, sc.date, "Heat EMS calls"), width="stretch")
+    else:
+        st.info("Click a neighbourhood on the map to see its observed vs forecast calls here.")
+    st.markdown("**City total: GLM, GBM, ensemble and actual**")
+    st.altair_chart(models_chart(dl.city_models_history(sc.date), sc.date), width="stretch")
+    st.caption("30 days before and 7 days after the chosen date (dashed line). Forecasts are issued the evening before; "
+               "the band is the ensemble's 90% interval.")
 
 
-def deploy_page(sc: dl.Scenario, fc):
+def deploy_page(sc: dl.Scenario, fc, demand: pd.DataFrame):
     backend, label = dl.solver_backend()
     st.subheader(f"Daily deployment · {sc.label}")
     (st.success if label.startswith("Gurobi") else st.warning)(f"Optimiser: {label}")
@@ -132,13 +184,13 @@ def deploy_page(sc: dl.Scenario, fc):
                                  "max_shifts": 1})
     doctors = st.data_editor(default_docs, num_rows="dynamic", width="stretch", key=f"doctors_{n_doc}")
 
-    sites = dl.candidate_sites(source, fc.demand, radius)
-    st.caption(f"{len(sites)} candidate sites · {fc.demand.scenario.nunique()} representative forecast scenarios "
-               f"(stratified quantiles of the citywide predictive distribution)")
+    sites = dl.candidate_sites(source, demand, radius)
+    st.caption(f"{len(sites)} candidate sites · demand for the 42 neighbourhoods in {demand.scenario.nunique()} "
+               f"equally likely forecast scenarios (10th-90th percentiles of the citywide forecast)")
     if st.button("Solve deployment", type="primary"):
         blocks = sorted({int(h) for r in shifts.itertuples() for h in (r.start_hour, r.end_hour)})
         with st.spinner("Gurobi is optimising..."):
-            plan, used = dl.run_solver(n_tents, sites, doctors, shifts, fc.demand, walk_radius_km=radius, distance_decay_km=decay,
+            plan, used = dl.run_solver(n_tents, sites, doctors, shifts, demand, walk_radius_km=radius, distance_decay_km=decay,
                                        patients_per_doctor_hour=rate, min_doctors_per_open_tent=int(min_docs),
                                        max_doctors_per_tent=int(max_docs), time_limit_s=60.0, mip_gap=0.01,
                                        hour_blocks=list(zip(blocks[:-1], blocks[1:])))
@@ -168,16 +220,18 @@ def deploy_page(sc: dl.Scenario, fc):
                   pickable=True),
     ]
     st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=VIEW, map_style="light",
-                             tooltip={"text": "{name}\ndoctors {doctors_total}\nZIP area {area_id}\nunserved {unserved}"}),
+                             tooltip={"text": "{name}\ndoctors {doctors_total}\nunserved {unserved}"}),
                     width="stretch")
-    st.caption("Map: expected cases not reached by a tent, by area (colour); open tents (dots sized by doctors) and walking catchments (rings).")
+    st.caption("Map: expected cases not reached by a tent, by neighbourhood (colour); open tents (dots sized by doctors) and walking catchments (rings).")
     a, b = st.columns(2)
     a.markdown("**Open tents**")
     a.dataframe(plan.open_sites, width="stretch", hide_index=True)
     b.markdown("**Doctor assignments**")
     b.dataframe(plan.assignments, width="stretch", hide_index=True)
-    st.markdown("**Areas with the most unserved expected cases**")
-    st.dataframe(served.sort_values("unserved", ascending=False).head(15).round(2), width="stretch", hide_index=True)
+    st.markdown("**Neighbourhoods with the most unserved expected cases**")
+    worst = dl.neighbourhoods()[["area_id", "name", "borough"]].merge(served, on="area_id")
+    st.dataframe(worst.sort_values("unserved", ascending=False).head(15).drop(columns="area_id").round(2),
+                 width="stretch", hide_index=True)
     d1, d2 = st.columns(2)
     d1.download_button("Download assignments (CSV)", plan.assignments.to_csv(index=False), "assignments.csv", "text/csv")
     d2.download_button("Download open tents (CSV)", plan.open_sites.to_csv(index=False), "open_tents.csv", "text/csv")
@@ -185,15 +239,12 @@ def deploy_page(sc: dl.Scenario, fc):
 
 sc = sidebar_scenario()
 fc = cached_forecast(sc)
-st.sidebar.caption("The optimiser plans for 5 equally likely versions of tomorrow: the 10th, 30th, 50th, 70th and "
-                   "90th percentiles of the citywide forecast.")
-st.sidebar.divider()
-st.sidebar.caption("Models: citywide DLNM-NB + LightGBM ensemble with analog forecast-error Monte Carlo; "
-                   "area shares by the beach & event share model (weekend/holiday, beach season, event calendar); "
-                   "Gurobi two-stage stochastic MILP.")
-page = st.sidebar.radio("Screen", ["Forecast / simulation", "Deploy"])
 st.title("NYC heat-illness response")
+if dl.MOCK:
+    st.caption(f"⚠️ {dl.DATA_SOURCE}")
+page = st.radio("Screen", ["Forecast / simulation", "Deploy"], horizontal=True, label_visibility="collapsed")
+demand = cached_nb_demand(sc)
 if page == "Forecast / simulation":
-    forecast_page(sc, fc)
+    forecast_page(sc, fc, demand)
 else:
-    deploy_page(sc, fc)
+    deploy_page(sc, fc, demand)
