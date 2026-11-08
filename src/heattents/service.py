@@ -21,11 +21,17 @@ from .ingest.geography import load_neighbourhoods, modzcta_to_neighbourhood
 from .models.scenarios import (N_SCENARIOS, build_demand, hour_profile, mapped_fraction, neighbourhood_demand,
                                scenario_table)
 
+PEOPLE_PER_CALL = 20.0  # people needing help per EMS heat call (planning assumption); applied right after the forecast
 REFERENCE_DATE = "2025-07-15"  # template row set for user scenarios (static columns only are kept)
 
 
 @dataclass
 class DayForecast:
+    """One day's forecast. UNITS: PEOPLE needing help = EMS heat calls x PEOPLE_PER_CALL (20), for every count below
+    (city mean and quantiles, samples, scenario totals, area and neighbourhood numbers, demand tables, observed
+    counts). The models are trained and run on calls; to_people() converts their output once, right after the
+    forecast, so everything downstream (maps, optimiser) works in people. Shares and probabilities are unchanged
+    (p_ge50 / p_ge100 / p_ge1 still refer to calls)."""
     label: str
     city: pd.Series  # mean, q05..q95, p_ge50, p_ge100
     samples: np.ndarray  # predictive samples of the citywide total
@@ -38,7 +44,26 @@ class DayForecast:
     #                                             q05, q95, p_ge1 (, observed)
     # THE PREDICTION OUTPUT for the optimiser: 5 equally likely scenarios x 42 neighbourhoods, daily calls
     scenarios: pd.DataFrame | None = None  # scenario, label, percentile, city_total, located_total, probability
-    demand_neighbourhood: pd.DataFrame | None = None  # uhf, scenario, probability, expected_cases
+    demand_neighbourhood: pd.DataFrame | None = None  # uhf, scenario, probability, expected_cases (people)
+    people_per_call: float = 1.0  # 1 = still in calls; PEOPLE_PER_CALL after to_people()
+
+
+def to_people(fc: DayForecast, k: float = PEOPLE_PER_CALL) -> DayForecast:
+    """Convert every count of a DayForecast from EMS calls to people needing help (x k). Applied once."""
+    if fc.people_per_call != 1.0:
+        return fc
+    pred = fc.city.copy()
+    for c in pred.index:
+        if c == "mean" or str(c).startswith("q"):
+            pred[c] = pred[c] * k
+    scale = lambda df, cols: df.assign(**{c: df[c] * k for c in cols if c in df}) if df is not None else None
+    return DayForecast(
+        fc.label, pred, fc.samples * k, scale(fc.areas, ["expected"]), scale(fc.demand, ["expected_cases"]),
+        None if fc.observed_total is None else fc.observed_total * k,
+        None if fc.observed_areas is None else fc.observed_areas * k,
+        scale(fc.neighbourhoods, ["expected", "q05", "q95", "observed"]),
+        scale(fc.scenarios, ["city_total", "located_total"]),
+        scale(fc.demand_neighbourhood, ["expected_cases"]), people_per_call=k)
 
 
 class ForecastService:
@@ -120,7 +145,7 @@ class ForecastService:
         obs_areas = rows.set_index("modzcta").y if observed is not None and "y" in rows else None
         nb = self._neighbourhoods(areas, samples, rng, obs_areas)
         nb_demand = neighbourhood_demand(nb, totals, self.mapped)
-        return DayForecast(label, pred, samples, areas, demand, observed, obs_areas, nb, scen, nb_demand)
+        return to_people(DayForecast(label, pred, samples, areas, demand, observed, obs_areas, nb, scen, nb_demand))
 
     def forecast_date(self, date, n_samples: int = 4000, seed: int = 0) -> DayForecast:
         """Forecast a historical day as issued at 18:00 the evening before (archived 1-day-ahead weather forecast)."""

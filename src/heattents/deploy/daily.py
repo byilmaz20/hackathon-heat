@@ -6,8 +6,8 @@ workers W in advance.
 
 DEMAND = PEOPLE, NOT CALLS. EMS calls are the tip of heat illness (the busiest neighbourhood typically has 1 call a day,
 >10 on 0.5% of days). A tent serves the many overheated people who never call 911, so the forecast is used as an
-urgency signal and scaled: tent visitors D_as = k * (forecast calls at a, scenario s), with k = people needing a tent
-per EMS heat call (a planning assumption; default 20, results reported for 10-50).
+urgency signal and scaled to people: the forecast service converts its output once (service.to_people, 20 people
+per EMS heat call), so the demand D_as reaching this model is already in people and visitors_per_call = 1.
 
 WHO CAN REACH A TENT (default, walking_request): people walk at most 15 minutes. Demand is placed at points inside
 each ZIP area (its forecast share, spread over up to 4 interior points); tents stand at NYC parks and plazas (up to
@@ -20,14 +20,16 @@ Sets
     J     candidate tent sites, each in one neighbourhood g(j);   A  demand points;   S  the 5 scenarios, p_s = 0.2
     R(j)  points within reach of site j
 Parameters
-    D_as  expected tent visitors at point a in scenario s = k * forecast calls;   c  patients per worker per day (30)
+    D_as  expected people needing help at point a in scenario s (forecast, in people);   c  people per worker per day (30)
 First stage (decided the evening before, the same in every scenario)
     x_j in {0,1}   tent opened at site j;      y_j in Z+   health workers at site j
 Second stage (per scenario)
     f_jas >= 0     visitors from point a served at tent j (a in R(j));   z_as >= 0   visitors at a left unanswered
 
     min   sum_s p_s sum_a z_as                                         expected unanswered visitors
-    s.t.  sum_j x_j <= N;   sum_{j: g(j)=u} x_j <= 1   for all u       tents available; at most one per neighbourhood
+    s.t.  sum_j x_j <= N;   sum_{j: g(j)=u} x_j <= Q   for all u       tents available; at most Q per neighbourhood
+          sum_s p_s sum_{a in R(j)} f_jas >= M x_j      for all j       an open tent serves at least M people
+                                                                        (M = k x min calls per tent; default 0, Q = 1)
           sum_j y_j <= W;   x_j <= y_j <= W x_j                         workers; an open tent has >= 1, a closed none
           sum_{a in R(j)} f_jas <= c y_j                for all j, s    a tent treats at most c per worker
           sum_{j: a in R(j)} f_jas + z_as = D_as        for all a, s    every visitor is served or unanswered
@@ -56,6 +58,7 @@ from ..config import PATHS, Paths
 STATUS = {GRB.OPTIMAL: "optimal", GRB.TIME_LIMIT: "time_limit", GRB.INFEASIBLE: "infeasible",
           GRB.SUBOPTIMAL: "suboptimal", GRB.INTERRUPTED: "interrupted"}
 WALK_MINUTES, WALK_SPEED_KMH, DETOUR = 15.0, 5.0, 1.3
+TIEBREAK_TIME_S = 5.0  # per tie-breaking step (steps 2-3)
 
 
 def walk_radius_km(minutes: float = WALK_MINUTES, speed_kmh: float = WALK_SPEED_KMH, detour: float = DETOUR) -> float:
@@ -88,7 +91,10 @@ class DailyRequest:
     point_neighbourhood: dict[str, str]
     names: dict[str, str] | None = None
     patients_per_worker_day: float = 30.0
-    visitors_per_call: float = 20.0
+    visitors_per_call: float = 1.0  # demand is already in people (forecast output); >1 only for demand given in calls
+    max_per_neighbourhood: int = 1  # Q: tents allowed in the same neighbourhood
+    unlimited_capacity: bool = False  # True: a tent helps everyone within reach; workers are ignored (coverage model)
+    min_calls_per_hospital: float = 0.0  # an open tent must serve >= this many calls' worth of people (x k), expected
     time_limit_s: float = 60.0
     mip_gap: float = 1e-4
     info: dict = field(default_factory=dict)
@@ -145,14 +151,42 @@ def candidate_parks(points: pd.DataFrame, visitors: np.ndarray, radius_km: float
     return S[["site", "name", "neighbourhood", "lat", "lon", "kind", "reachable_visitors"]]
 
 
+def candidate_grid(points: pd.DataFrame, radius_km: float, spacing_km: float = 0.4, paths: Paths = PATHS) -> pd.DataFrame:
+    """Tent sites anywhere on land: a regular grid (every ``spacing_km``) inside the 42 neighbourhoods. Spots that
+    reach no demand point, or exactly the same demand points as another spot in the same neighbourhood, are dropped
+    (they can never do better), which keeps the MILP small."""
+    from shapely import contains_xy
+    from ..ingest.geography import load_neighbourhoods
+    N = load_neighbourhoods(paths)
+    k = np.cos(np.radians(40.7))
+    minx, miny, maxx, maxy = np.array([g.bounds for g in N.geometry]).T
+    lons = np.arange(minx.min(), maxx.max(), spacing_km / (111.32 * k))
+    lats = np.arange(miny.min(), maxy.max(), spacing_km / 110.57)
+    LON, LAT = (a.ravel() for a in np.meshgrid(lons, lats))
+    rows = []
+    for r in N.itertuples():
+        inside = contains_xy(r.geometry, LON, LAT)
+        rows.append(pd.DataFrame({"lat": LAT[inside], "lon": LON[inside], "neighbourhood": r.uhf, "nb_name": r.name}))
+    G = pd.concat(rows, ignore_index=True)
+    within = _km(G.lat, G.lon, points.lat, points.lon) <= radius_km
+    G["key"] = [tuple(np.flatnonzero(w)) for w in within]
+    G = G[G.key.map(len) > 0].drop_duplicates(["neighbourhood", "key"]).reset_index(drop=True)
+    G["site"] = [f"grid{i}" for i in range(len(G))]
+    G["name"] = [f"{n} · {la:.4f}, {lo:.4f}" for n, la, lo in zip(G.nb_name, G.lat, G.lon)]
+    G["kind"] = "open location"
+    return G[["site", "name", "neighbourhood", "lat", "lon", "kind"]]
+
+
 def walking_request(fc, n_tents: int, n_workers: int, walk_minutes: float = WALK_MINUTES,
                     walk_speed_kmh: float = WALK_SPEED_KMH, detour: float = DETOUR, per_neighbourhood: int = 5,
-                    visitors_per_call: float = 20.0, paths: Paths = PATHS, **kw) -> DailyRequest:
+                    visitors_per_call: float = 1.0, site_mode: str = "parks", grid_spacing_km: float = 0.4,
+                    radius_km: float | None = None, paths: Paths = PATHS, **kw) -> DailyRequest:
     """15-minute-walk version from a service.DayForecast: demand at points inside each ZIP area (the area's forecast
-    share of every scenario total, spread equally over up to 4 interior points), tents at parks and plazas."""
+    share of every scenario total, spread equally over up to 4 interior points). Tent sites: site_mode="parks" (the
+    best NYC parks and plazas per neighbourhood) or "anywhere" (a grid every grid_spacing_km over all land)."""
     from ..ingest.geography import modzcta_to_neighbourhood
     from ..models.scenarios import demand_points
-    radius = walk_radius_km(walk_minutes, walk_speed_kmh, detour)
+    radius = radius_km if radius_km else walk_radius_km(walk_minutes, walk_speed_kmh, detour)
     nb_of = modzcta_to_neighbourhood(paths)
     pts = demand_points(4).merge(fc.areas[["modzcta", "share"]], on="modzcta")
     pts = pts.assign(point=pts.area_id.astype(str), neighbourhood=pts.modzcta.map(nb_of))
@@ -162,10 +196,13 @@ def walking_request(fc, n_tents: int, n_workers: int, walk_minutes: float = WALK
                         for r in sc.itertuples()], ignore_index=True)
     mean_visitors = visitors_per_call * (pts.share * pts.weight).to_numpy() * float((sc.located_total * sc.probability).sum())
     sites = candidate_parks(pts, mean_visitors, radius, per_neighbourhood, paths)
+    if site_mode == "anywhere":  # the grid plus the park candidates, so "anywhere" can never do worse than parks
+        sites = pd.concat([sites, candidate_grid(pts, radius, grid_spacing_km, paths)], ignore_index=True)
     within = _km(sites.lat, sites.lon, pts.lat, pts.lon) <= radius
     reach = {s: pts.point[within[i]].tolist() for i, s in enumerate(sites.site)}
     names = dict(zip(fc.neighbourhoods.uhf, fc.neighbourhoods.name))
-    info = dict(walk_minutes=walk_minutes, walk_speed_kmh=walk_speed_kmh, detour=detour, radius_km=radius,
+    info = dict(point_latlon=pts[["point", "lat", "lon"]], walk_minutes=walk_minutes, walk_speed_kmh=walk_speed_kmh,
+                detour=detour, radius_km=radius,
                 demand_points=len(pts), candidate_sites=len(sites),
                 visitors_within_reach_of_any_site=float(mean_visitors[within.any(0)].sum() / mean_visitors.sum()))
     return DailyRequest(n_tents, n_workers, demand, sites, reach, dict(zip(pts.point, pts.neighbourhood)), names,
@@ -186,6 +223,8 @@ class DailyPlan:
 
 # --- model ------------------------------------------------------------------------------------------------------------
 def solve(req: DailyRequest, env: gp.Env | None = None, verbose: bool = False) -> DailyPlan:
+    if req.unlimited_capacity:
+        return solve_coverage(req, env, verbose)
     t0 = time.time()
     calls = req.demand.pivot_table(index="point", columns="scenario", values="expected_cases", aggfunc="sum").fillna(0.0)
     prob = req.demand.groupby("scenario").probability.first().reindex(calls.columns).to_numpy()
@@ -217,7 +256,12 @@ def solve(req: DailyRequest, env: gp.Env | None = None, verbose: bool = False) -
     m.setObjective(expected_unanswered, GRB.MINIMIZE)
     m.addConstr(x.sum() <= req.n_tents, "tents")
     for g in set(group.values()):
-        m.addConstr(gp.quicksum(x[j] for j in J if group[j] == g) <= 1, f"one_per_neighbourhood[{g}]")
+        m.addConstr(gp.quicksum(x[j] for j in J if group[j] == g) <= req.max_per_neighbourhood,
+                    f"max_per_neighbourhood[{g}]")
+    min_people = req.min_calls_per_hospital * req.visitors_per_call
+    if min_people > 0:  # an open tent must be worth opening: expected people served >= M
+        m.addConstrs((gp.quicksum(p[s] * f[j, a, s] for a in reach[j] for s in S) >= min_people * x[j] for j in J),
+                     "min_people_per_tent")
     m.addConstr(y.sum() <= W, "workers")
     m.addConstrs((y[j] >= x[j] for j in J), "min_one_worker")
     m.addConstrs((y[j] <= W * x[j] for j in J), "workers_only_at_open_tents")
@@ -233,7 +277,8 @@ def solve(req: DailyRequest, env: gp.Env | None = None, verbose: bool = False) -
         need = {j: sum(p[s] * d[a, s] for a in reach[j] for s in S) for j in J}  # expected visitors within reach
         top = max(need.values()) or 1.0
         tent_need = gp.quicksum(need[j] / top * x[j] for j in J)
-        m.Params.MIPGap = 0.0  # tie-breaking steps are solved exactly (the model is small)
+        m.Params.MIPGap = 0.0  # tie-breaking steps: exact when the model is small,
+        m.Params.TimeLimit = TIEBREAK_TIME_S  # but capped in time (they never change the number of people helped)
         m.setObjective(tent_need, GRB.MAXIMIZE)
         m.optimize()  # step 2: among equally good plans, tents where the most people are within reach
         u_star = m.ObjVal
@@ -273,7 +318,9 @@ def _report(req, m, x, y, f, z, A, S, J, reach, d, p, calls, group, status, t0) 
         if "lat" in site.columns:
             row.update(lat=float(site.loc[j, "lat"]), lon=float(site.loc[j, "lon"]))
         rows.append(row)
-    T = pd.DataFrame(rows).sort_values("answered", ascending=False).reset_index(drop=True)
+    cols = ["site", "name", "neighbourhood", "neighbourhood_name", "workers", "capacity", "reachable_visitors",
+            "answered", "answered_busiest", "utilisation"] + (["lat", "lon"] if "lat" in site.columns else [])
+    T = pd.DataFrame(rows, columns=cols).sort_values("answered", ascending=False).reset_index(drop=True)
 
     pn = pd.Series(req.point_neighbourhood)
     P = pd.DataFrame({"point": A, "neighbourhood": pn.reindex(A).to_numpy(),
@@ -302,7 +349,116 @@ def _report(req, m, x, y, f, z, A, S, J, reach, d, p, calls, group, status, t0) 
                 within_reach_pct=100 * float(P[P.point.isin(reachable_pts)].expected_visitors.sum()) / vis if vis else 0.0,
                 tents_open=len(open_), workers_placed=int(sum(round(y[j].X) for j in J)),
                 tents_available=req.n_tents, workers_available=req.n_workers,
-                capacity_per_day=c * sum(round(y[j].X) for j in J), **req.info)
+                capacity_per_day=c * sum(round(y[j].X) for j in J),
+                **{k: v for k, v in req.info.items() if k != "point_latlon"})
     stats = dict(sites=len(J), demand_points=len(A), arcs=sum(len(v) for v in reach.values()), binaries=len(J), integers=len(J),
                  continuous=len(f) + len(z), constraints=m.NumConstrs)
+    return DailyPlan(T, nb, sc, kpis, status, m.MIPGap if m.IsMIP else 0.0, time.time() - t0, stats)
+
+
+# --- coverage version: unlimited capacity ---------------------------------------------------------------------------
+def solve_coverage(req: DailyRequest, env: gp.Env | None = None, verbose: bool = False) -> DailyPlan:
+    r"""Maximum-coverage version (unlimited_capacity=True): a tent helps everyone within reach; workers are ignored.
+
+        max  sum_a E[D_a] u_a          E[D_a] = sum_s p_s D_as   (expected people at point a)
+        s.t. u_a <= sum_{j: a in R(j)} x_j      for all a     a point is covered only if an open tent reaches it
+             sum_j x_j <= N;   sum_{j: g(j)=u} x_j <= Q;   x_j in {0,1};   0 <= u_a <= 1
+    Without capacity the scenarios enter only through their expectation, so the per-scenario flows are not needed.
+    Tie-break (keeps the optimum): tents where the most people are within reach. For the report each covered point is
+    attributed to its nearest open tent, so per-tent "answered" never counts a person twice.
+    """
+    t0 = time.time()
+    calls = req.demand.pivot_table(index="point", columns="scenario", values="expected_cases", aggfunc="sum").fillna(0.0)
+    prob = req.demand.groupby("scenario").probability.first().reindex(calls.columns).to_numpy()
+    if not np.isclose(prob.sum(), 1.0):
+        raise ValueError(f"scenario probabilities sum to {prob.sum()}, expected 1")
+    Dm = calls * req.visitors_per_call
+    A, S = Dm.index.astype(str).tolist(), Dm.columns.tolist()
+    E = dict(zip(A, Dm.to_numpy() @ prob))
+    J = req.sites.site.astype(str).tolist()
+    group = dict(zip(J, req.sites.neighbourhood.astype(str)))
+    Aset = set(A)
+    reach = {j: [a for a in req.reach.get(j, []) if a in Aset] for j in J}
+    by_point = {a: [] for a in A}
+    for j in J:
+        for a in reach[j]:
+            by_point[a].append(j)
+
+    m = gp.Model("daily_tents_coverage", env=env) if env is not None else gp.Model("daily_tents_coverage")
+    m.Params.OutputFlag = int(verbose)
+    m.Params.TimeLimit, m.Params.MIPGap = req.time_limit_s, req.mip_gap
+    x = m.addVars(J, vtype=GRB.BINARY, name="x")
+    u = m.addVars(A, lb=0.0, ub=1.0, name="u")
+    covered = gp.quicksum(E[a] * u[a] for a in A)
+    m.setObjective(covered, GRB.MAXIMIZE)
+    m.addConstr(x.sum() <= req.n_tents, "tents")
+    for g in set(group.values()):
+        m.addConstr(gp.quicksum(x[j] for j in J if group[j] == g) <= req.max_per_neighbourhood, f"max_per_nb[{g}]")
+    m.addConstrs((u[a] <= gp.quicksum(x[j] for j in by_point[a]) for a in A), "covered_only_if_reached")
+    m.optimize()  # step 1: most expected people within reach of an open tent
+    if m.SolCount and m.Status in (GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL):
+        v = m.ObjVal
+        m.addConstr(covered >= v - 1e-8 * max(1.0, v), "keep_step1")
+        need = {j: sum(E[a] for a in reach[j]) for j in J}
+        top = max(need.values()) or 1.0
+        m.setObjective(gp.quicksum(need[j] / top * x[j] for j in J), GRB.MAXIMIZE)
+        m.Params.MIPGap, m.Params.TimeLimit = 0.0, TIEBREAK_TIME_S
+        m.optimize()  # step 2: on ties, tents where the most people are within reach
+    status = STATUS.get(m.Status, str(m.Status))
+    if m.SolCount == 0:
+        raise RuntimeError(f"no solution found (status {status})")
+
+    names = req.names or {}
+    open_ = [j for j in J if x[j].X > 0.5]
+    site = req.sites.assign(site=req.sites.site.astype(str)).set_index("site")
+    cov = {a for j in open_ for a in reach[j]}
+    owner = {}  # nearest open tent of each covered point (report only)
+    if open_ and "lat" in site.columns:
+        pts = pd.DataFrame({"point": list(cov)})
+        latlon = req.info.get("point_latlon")
+        if latlon is not None:
+            P = latlon.set_index("point").reindex(pts.point)
+            Dk = _km(P.lat, P.lon, site.loc[open_, "lat"], site.loc[open_, "lon"])
+            for i, a in enumerate(pts.point):
+                cand = [k for k, j in enumerate(open_) if a in set(reach[j])]
+                owner[a] = open_[min(cand, key=lambda k: Dk[i, k])]
+    for a in cov:
+        owner.setdefault(a, next(j for j in open_ if a in set(reach[j])))
+    rows = []
+    for j in open_:
+        mine = [a for a in cov if owner[a] == j]
+        row = dict(site=j, name=site.loc[j, "name"], neighbourhood=group[j],
+                   neighbourhood_name=names.get(group[j], group[j]), workers=0, capacity=np.nan,
+                   reachable_visitors=sum(E[a] for a in reach[j]), answered=sum(E[a] for a in mine),
+                   answered_busiest=float(Dm.loc[mine, S[-1]].sum()) if mine else 0.0, utilisation=np.nan)
+        if "lat" in site.columns:
+            row.update(lat=float(site.loc[j, "lat"]), lon=float(site.loc[j, "lon"]))
+        rows.append(row)
+    cols = ["site", "name", "neighbourhood", "neighbourhood_name", "workers", "capacity", "reachable_visitors",
+            "answered", "answered_busiest", "utilisation"] + (["lat", "lon"] if "lat" in site.columns else [])
+    T = pd.DataFrame(rows, columns=cols).sort_values("answered", ascending=False).reset_index(drop=True)
+    pn = pd.Series(req.point_neighbourhood)
+    P = pd.DataFrame({"point": A, "neighbourhood": pn.reindex(A).to_numpy(),
+                      "forecast_calls": calls.to_numpy() @ prob, "expected_visitors": [E[a] for a in A],
+                      "unanswered": [0.0 if a in cov else E[a] for a in A]})
+    nb = P.groupby("neighbourhood", as_index=False)[["forecast_calls", "expected_visitors", "unanswered"]].sum()
+    nb["answered"] = nb.expected_visitors - nb.unanswered
+    nb["answered_pct"] = 100 * nb.answered / nb.expected_visitors.where(nb.expected_visitors > 0)
+    nb.insert(1, "name", nb.neighbourhood.map(lambda g: names.get(g, g)))
+    nb = nb[["neighbourhood", "name", "forecast_calls", "expected_visitors", "answered", "unanswered", "answered_pct"]]
+    nb = nb.sort_values("unanswered", ascending=False).reset_index(drop=True)
+    covered_mask = Dm.index.isin(list(cov))
+    sc = pd.DataFrame({"scenario": S, "probability": prob, "visitors": Dm.sum().to_numpy(),
+                       "answered": Dm[covered_mask].sum().to_numpy()})
+    sc["unanswered"] = sc.visitors - sc.answered
+    sc["answered_pct"] = 100 * sc.answered / sc.visitors.where(sc.visitors > 0)
+    sc = sc[["scenario", "probability", "visitors", "answered", "unanswered", "answered_pct"]]
+    vis, ans = float(sum(E.values())), float(sum(E[a] for a in cov))
+    kpis = dict(visitors_per_call=req.visitors_per_call, expected_visitors=vis, expected_answered=ans,
+                expected_unanswered=vis - ans, answered_pct=100 * ans / vis if vis else 0.0,
+                within_reach_pct=100 * ans / vis if vis else 0.0, tents_open=len(open_), workers_placed=0,
+                tents_available=req.n_tents, workers_available=0, capacity_per_day=np.nan, unlimited_capacity=True,
+                **{k: v for k, v in req.info.items() if k != "point_latlon"})
+    stats = dict(sites=len(J), demand_points=len(A), arcs=sum(len(v) for v in reach.values()), binaries=len(J),
+                 continuous=len(A), constraints=m.NumConstrs)
     return DailyPlan(T, nb, sc, kpis, status, m.MIPGap if m.IsMIP else 0.0, time.time() - t0, stats)
