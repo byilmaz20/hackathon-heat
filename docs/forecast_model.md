@@ -150,12 +150,24 @@ analogs: past forecasts of similar heat, already verified by the issue time. Cou
 
 | | GLM (DLNM negative binomial) | LightGBM |
 |---|---|---|
-| **Strength** | Smooth, physically shaped heat response that **extrapolates sensibly** past the hottest training days (linear in log-calls beyond 35 °C); proper count model whose dispersion gives the prediction intervals; 33 interpretable coefficients, stable with few extreme days | Finds **interactions** without specifying them (heat × humidity × streak × weekend × time of season); fits ordinary days better; monotone constraints keep it physically sensible |
+| **Strength** | Smooth, physically shaped heat response that **extrapolates sensibly** past the hottest training days (linear in log-calls beyond 35 °C); proper count model whose dispersion gives the prediction intervals; 33 interpretable coefficients, stable with few extreme days | Finds **interactions** without specifying them (heat × humidity × streak × weekend × time of season); fits typical hot days better; monotone constraints keep it physically sensible |
 | **Weakness** | Only the interactions we write into it | **Cannot extrapolate**: beyond the hottest day it has seen, a tree's prediction is flat, so it under-forecasts record heat |
 | **Test result alone** (CRPS / mean abs. error) | 2.57 / 3.96 | 2.44 / 3.56 |
 
-Their errors lean in opposite directions: over 2024–26 the GLM forecast 3,912 calls and LightGBM 3,443, against 3,541
-actual. Averaging cancels part of both (ensemble 3,677):
+Which model is better depends on the kind of day (mean absolute error in calls per day, 2024–26 out of sample):
+
+| Days | GLM | LightGBM | Ensemble |
+|---|---|---|---|
+| Ordinary days (bottom 90% by calls, 401 days) | 1.88 | 1.90 | **1.83** |
+| Busy days (top 10%, 49 days) | 21.0 | 17.0 | **15.6** |
+| Record days (8 busiest) | 35.5 | 50.8 | **23.6** |
+
+On ordinary days the two are tied. LightGBM is better on typical hot days, which resemble many past summer days; it
+was closer on 78% of the busy days. The GLM is better only on record heat, where the trees go flat. On the two record
+days, 2–3 July 2026, the GLM was too high and LightGBM too low by similar amounts, so the average landed close. Over
+the whole test the GLM forecast 3,912 calls and LightGBM 3,443, against 3,541 actual (ensemble 3,677). Their errors
+have opposite signs on only 13% of all days, but even when both miss in the same direction the average is pulled
+towards the better one:
 
 | 2024–26, 450 test days | CRPS ↓ | twCRPS ≥ 50 calls ↓ | Mean abs. error ↓ | 90% coverage |
 |---|---|---|---|---|
@@ -322,6 +334,7 @@ follows is separate (about 1 minute to a 1% optimality gap).
 .venv/bin/heattents features   # area table, citywide series, area × day panel
 .venv/bin/heattents city       # city model: 2024–26 backtest + final model → outputs/models/city/
 .venv/bin/heattents area       # share model: 2018–26 backtest + final model → outputs/models/share/
+.venv/bin/python app/precompute.py   # 2026 out-of-sample neighbourhood forecasts + plan comparison for the app
 .venv/bin/streamlit run app/streamlit_app.py
 ```
 

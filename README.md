@@ -1,8 +1,8 @@
-# NYC Heat Response: probabilistic heat-illness forecasting and daily tent & doctor deployment
+# NYC Heat Response: probabilistic heat-illness forecasting and daily field-hospital placement
 
-On a heatwave morning a New York City planner has a handful of pop-up cooling tents and a roster of doctors with shift
-availability. **Where should the tents go today, and who should staff which tent in which shift, so that as many
-heat-illness cases as possible are treated?**
+On the evening before a hot day a New York City planner has a handful of field hospitals (pop-up cooling tents).
+**How many people will need help tomorrow, where, and where should the field hospitals go so that as many of them as
+possible are within reach?**
 
 This project answers that question end to end, from public data:
 
@@ -11,7 +11,7 @@ EMS heat calls (label) ─┐
 weather + forecasts ────┼─► [1] citywide probabilistic forecast ──┐
 upstream cities ────────┘     (DLNM-NB + LightGBM, forecast-error MC)│
                                                                       ├─► [3] daily demand: 42 neighbourhoods × 5 scenarios ─► [4] Gurobi MILP ─► app
-weekend, beach, events ────► [2] beach & event share model ─────────┘     (10/30/50/70/90th percentiles)   (tents, health workers)
+weekend, beach, events ────► [2] beach & event share model ─────────┘     (10/30/50/70/90th percentiles)   (field hospitals)
 (usual share per ZIP area)
 ```
 
@@ -28,7 +28,7 @@ models learn directly from 17,688 geocoded NYC EMS heat calls (2005–2026).
 | **Calibration** | 90% prediction intervals contain the actual count on 96% of days. Forecasts correlate **0.89** with an *independent* label (citywide heat ED visits). |
 | **Busiest days** | 6 of the 8 test days with ≥ 50 calls were flagged the evening before. On 2 July 2026 (231 calls) the forecast was 211. |
 | **Where** | The usual map is stable (area rank correlation 0.94 between 2005–15 and 2016–26) and is driven by *daytime presence*, not resident vulnerability. The beach & event share model moves it where the data supports a move: weekends/holidays, beach season and permitted events (+0.11 nats/call on event days, with calibrated moves). Heat moves *how many* calls, not *where*. |
-| **Decision** | 10 tents and 22 doctors on 2 July 2026 reach **~20%** of the day's expected cases within a 1 km walk. Capacity is not the bottleneck on that day; reach is. The Gurobi model solves to <1% gap in ~1 minute. |
+| **Decision** | A maximum-coverage MILP places N field hospitals (2 km reach, up to 3 per neighbourhood, sites anywhere on land) in about a second. With 10 hospitals and out-of-sample forecasts it reached **54%** of the people who actually needed help on 21 Jun 2024 (population rule 29%, heat-vulnerability rule 40%) and **58%** on Pride Sunday 29 Jun 2025 (19% and 16%). |
 
 ---
 
@@ -43,7 +43,9 @@ brew install libomp                      # macOS only: OpenMP runtime for LightG
 .venv/bin/heattents features            # area table, citywide series, area × day panel
 .venv/bin/heattents city                # citywide model: 2024-26 evaluation, final model, heat curve  (~5 s)
 .venv/bin/heattents area                # share model: 2018-26 evaluation + final model               (~15 s)
+.venv/bin/python app/precompute.py      # data for the app's slide tabs                                (~30 s)
 .venv/bin/streamlit run app/streamlit_app.py
+./app/present.sh                        # optional: open the app full screen in a Chrome window (presentation)
 .venv/bin/pytest
 ```
 
@@ -57,13 +59,14 @@ src/heattents/
   features/      static area table, heat features, calendar, area × day panel
   models/        glm.py (IRLS, splines, DLNM cross-basis), city.py, context_share.py (share model), scenarios.py,
                  explain.py, diagnostics.py
-  deploy/        model.py (request/plan dataclasses), milp.py (Gurobi), candidates.py
+  deploy/        daily.py (daily field-hospital MILP, Gurobi), compare.py (plan vs rule-based placements),
+                 candidates.py (parks); model.py / milp.py: the earlier hourly tent & doctor model (not used by the app)
   service.py     "a day" -> forecasts, maps and optimiser input (used by the app and the evaluation)
   eda.py         exploratory analysis of the label
   cli.py
-app/             Streamlit decision-support app (data_layer.py is its only access to models and solver)
+app/             Streamlit app: forecast & plan, predictive model, MILP model and results tabs (see app/README.md)
 data/raw/        downloaded inputs          data/processed/  features
-outputs/         eda/, models/city/, models/share/
+outputs/         eda/, models/city/, models/share/, models/deploy_compare/, app/
 tests/           GLM/spline/conformal, city model, deployment MILP
 archive/london_v1/   the earlier London prototype (superseded)
 ```
@@ -170,57 +173,61 @@ $$
 
 Full specification with an example: [docs/forecast_model.md § Output](docs/forecast_model.md#output-what-the-forecast-hands-to-the-optimiser).
 
-### 4. Daily deployment: two-stage stochastic MILP ([deploy/milp.py](src/heattents/deploy/milp.py))
+### 4. Daily field-hospital placement: maximum-coverage MILP ([deploy/daily.py](src/heattents/deploy/daily.py))
 
-**Sets**
+Active planning rules (`app/data_layer.py`, `ACTIVE_RULES = "threshold"`): a hospital helps everyone within 2 km (no
+worker limit), hospitals can stand anywhere on land, up to 3 per neighbourhood.
 
 | Symbol | Meaning |
 |---|---|
-| $J$ | Candidate sites (NYC parks and plazas, screened to the 250 reaching most expected demand) |
-| $K$ | Doctors |
-| $S$ | Shifts |
-| $T$ | Time blocks aligned to shift boundaries |
-| $A$ | Demand points |
-| $W$ | Scenarios |
-| $R$ | Walkable pairs $(a,j)$ within the radius |
-
-**Variables**
-
-- $x_j\in\{0,1\}$: tent $j$ is set up.
-- $o_{js}\in\{0,1\}$: tent $j$ operates in shift $s$.
-- $y_{js}\in\mathbb Z_+$: doctors at tent $j$ in shift $s$.
-- $v_{ks}\in\{0,1\}$: doctor $k$ works shift $s$.
-- $f_{wajt}\ge 0$: cases from point $a$ treated at tent $j$ in block $t$ under scenario $w$.
-
-**Formulation**
+| $a$ | Demand points: up to 4 interior points per ZIP area (708), each carrying part of the area's forecast |
+| $j$ | Candidate sites: a 400 m grid over all land plus the best NYC parks and plazas per neighbourhood |
+| $s$ | The 5 forecast scenarios, $p_s = 0.2$ |
+| $D_{as}$ | People needing help at point $a$ in scenario $s$ |
+| $N$, $Q$ | Number of hospitals (input); at most $Q = 3$ per neighbourhood |
+| $R(j)$, $J_g$ | Points within 2 km of site $j$; sites in neighbourhood $g$ |
+| $x_j \in \{0,1\}$ | A hospital opens at site $j$ |
+| $u_a \in [0,1]$ | Point $a$ is within reach of an open hospital (takes 0 or 1 at the optimum) |
 
 $$
 \begin{aligned}
-\max\ & \tfrac{1}{|W|}\textstyle\sum_{w,(a,j),t} \rho_{aj}\, f_{wajt} \;-\; \varepsilon\big(\sum_j x_j + \sum_{k,s} v_{ks}\big) \qquad \rho_{aj}=e^{-d_{aj}/0.6\,\mathrm{km}}\\
-\text{s.t.}\ & \textstyle\sum_j x_j \le N_{\text{tents}};\quad o_{js}\le x_j;\quad \sum_s o_{js}\ge x_j\\
-& m_{\min}\, o_{js} \le y_{js} \le M_j\, o_{js};\qquad \textstyle\sum_j y_{js} = \sum_k v_{ks}\ \ \forall s\\
-& \textstyle\sum_s v_{ks} \le L_k;\quad v_{ks}+v_{ks'}\le 1 \text{ for overlapping } s,s';\quad v_{ks}=0 \text{ if } k \text{ unavailable}\\
-& \textstyle\sum_j f_{wajt} \le D_{wat} \qquad\qquad\qquad\qquad\ \ \forall w,a,t \quad\text{(demand)}\\
-& \textstyle\sum_a f_{wajt} \le \mu \sum_s c_{st}\, y_{js} \qquad\qquad\ \forall w,j,t \quad\text{(doctor capacity)}\\
-& f_{wajt} \le D_{wat} \textstyle\sum_{s:\,c_{st}>0} o_{js} \qquad\quad\ \forall w,(a,j),t \quad\text{(strong linking)}
+\max\ & \textstyle\sum_a \mathbb E[D_a]\, u_a, \qquad \mathbb E[D_a] = \sum_s p_s D_{as}\\
+\text{s.t.}\ & \textstyle\sum_j x_j \le N \qquad\qquad\qquad\qquad\ \text{(hospital budget)}\\
+& \textstyle\sum_{j \in J_g} x_j \le Q \quad \forall g \qquad\qquad\ \ \text{(at most 3 per neighbourhood)}\\
+& u_a \le \textstyle\sum_{j:\, a \in R(j)} x_j \quad \forall a \qquad\ \ \text{(helped only if a hospital is within 2 km)}\\
+& x_j \in \{0,1\},\ 0 \le u_a \le 1
 \end{aligned}
 $$
 
-- Doctors differ only by availability. The model therefore places *numbers* of doctors and recovers the named roster exactly, which keeps the binaries at $|K||S|+2|J||S|+|J|$ instead of $|K||J||S|$.
-- The **strong-linking** constraints (the classic strong facility-location formulation) cut the optimality gap on a real instance from 27% to 0.4%.
-- KPIs report both the distance-weighted objective and the **unweighted expected cases treated**.
+- $u_a \le 1$ means a person reached by two hospitals is counted once. There is no capacity: a hospital covers everyone in its circle.
+- On ties, a second step prefers hospitals with the most people within reach. Solved with Gurobi in about a second.
+- `ACTIVE_RULES = "previous"` switches back to the earlier **two-stage stochastic** version: parks only, a 15-minute walk, 4 health workers per hospital at 30 people per worker per day, one per neighbourhood. People are assigned to hospitals per scenario, and unhelped people are minimised.
 
-The **app** ([app/](app/)) runs exactly this pipeline:
-1. Pick a historical date (2024–26, forecast as issued the evening before), or type a scenario (heat index, day in the spell, weekend/holiday, upstream signal, yesterday's calls before 18:00).
-2. See the citywide forecast with intervals and a per-area risk map by shift.
-3. Enter tents, doctors and shifts, and let Gurobi return the plan, the roster and the unserved map.
+**Does it beat simple rules?** [deploy/compare.py](src/heattents/deploy/compare.py) scores each plan on the people who
+*actually* needed help that day. The forecasts are out of sample: the city and share models are refitted on earlier
+summers only. All plans get the same number of hospitals and the same rules. The population and heat-vulnerability
+rules place one hospital in each of the top N neighbourhoods, at the site there with the most residents within reach.
+
+| 10 hospitals, 2 km (`run_coverage`) | Fri 21 Jun 2024 (1,100 needed help) | Pride Sun 29 Jun 2025 (740) |
+|---|---|---|
+| Population rule | 315 (29%) | 140 (19%) |
+| Heat-vulnerability rule | 445 (40%) | 115 (16%) |
+| Historical-calls rule | 480 (44%) | 400 (54%) |
+| **Forecast + MILP** | **595 (54%)** | **430 (58%)** |
+| Best possible (MILP on what actually happened) | 745 (68%) | 560 (76%) |
+
+`run()` repeats the comparison under the previous (capacity) rules on all 59 days of 2024–26 with a forecast heat
+index ≥ 35 °C.
+
+The **app** ([app/](app/)) runs this pipeline for any day of May–September 2024–26 (forecast as issued the evening
+before) and presents the models as slides; see [app/README.md](app/README.md).
 
 ---
 
 ## Limitations
 
 - EMS calls are a proxy for heat illness. Peak days are censored by EMS saturation, and calls without a location (3.7%) count only towards the city total.
-- "Treated at a tent" means a case occurring within walking distance that tent capacity can absorb. The medical effect of a visit, and people's willingness to walk (the decay parameter), are assumptions.
+- "Helped" means being within 2 km of a field hospital. The medical effect of a visit, people's willingness to travel, and the ×20 people per call are assumptions. EMS calls give a ZIP code only, so people are placed at up to 4 points per ZIP area.
 - The share model is trained on where calls were *made*; a deployed tent may itself shift behaviour.
 - Within-city weather differences come from static surface-temperature data. Daily borough ERA5-Land series are supported but were not available within the Open-Meteo quota at build time.
-- The deployment model is solved for one day; multi-day planning (moving tents, crew fatigue) is not modelled.
+- The active model ignores capacity (no worker limit); the "previous" rules model it. Placement is solved one day at a time; multi-day planning (moving hospitals, staff fatigue) is not modelled.

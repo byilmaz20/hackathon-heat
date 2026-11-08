@@ -116,7 +116,8 @@ intercept. The dispersion α is chosen by profile likelihood over the grid
 ### 4.3 Ensemble
 
 $\hat\mu_d = \tfrac12(\mu^{\text{GLM}}_d + \mu^{\text{GBM}}_d)$. The GLM extrapolates sensibly to record heat; the trees
-fit ordinary days better. On test days the ensemble beats both components (Section 6).
+fit typical hot days better (on ordinary days the two are tied). On test days the ensemble beats both components, on
+every kind of day (Section 6; day-type breakdown in [forecast_model.md § 2.3](forecast_model.md#23-why-both-a-glm-and-gradient-boosted-trees)).
 
 ---
 
