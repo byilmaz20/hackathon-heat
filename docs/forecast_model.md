@@ -35,6 +35,13 @@ Full technical documentation of the city model: [city_model.md](city_model.md).
 Every evening the forecast produces **one table of daily demand: 42 neighbourhoods × 5 scenarios = 210 rows.** There
 is no hourly split; decisions are made for the whole day.
 
+**Units: people needing help.** The models are trained and run on EMS heat calls. Right after the forecast, every count
+is converted once to people: **people = calls × 20** (`PEOPLE_PER_CALL` in [service.py](../src/heattents/service.py),
+function `to_people`). A 911 call is the most severe tip of heat illness; for each call many more people are overheated
+but never call, and those are the people a field hospital serves. The factor 20 is a planning assumption, not a measured
+value. Converting only the output, never the training data, keeps the models' uncertainty correct. Everything
+downstream (maps, optimiser, comparison) works in people; nothing is multiplied again.
+
 **The 5 scenarios** are five equally likely versions of tomorrow's citywide total, from quiet to busy. They are the
 10th, 30th, 50th, 70th and 90th percentiles of the city model's forecast distribution. Each stands for one fifth of that
 distribution, so each has probability 0.2. The split across neighbourhoods is the same in all five; only the city
@@ -45,7 +52,7 @@ $$
 D^s_u = N^s \cdot m \cdot \pi_u, \qquad s = 0,\dots,4,\quad u = 1,\dots,42,\quad P(s) = 0.2
 $$
 
-- $N^s$: scenario *s*'s citywide total
+- $N^s$: scenario *s*'s citywide total, in people
 - $m = 0.96$: share of calls with a known location
 - $\pi_u$: the neighbourhood's share from the share model
 
@@ -53,11 +60,13 @@ $$
 
 | scenario | label | percentile | city_total | located_total | probability |
 |---|---|---|---|---|---|
-| 0 | quiet | 10 | 134.0 | 129.1 | 0.2 |
-| 1 | below average | 30 | 210.0 | 202.3 | 0.2 |
-| 2 | middle | 50 | 272.0 | 262.0 | 0.2 |
-| 3 | above average | 70 | 354.0 | 341.0 | 0.2 |
-| 4 | busy | 90 | 488.1 | 470.1 | 0.2 |
+| 0 | quiet | 10 | 2,680 | 2,581 | 0.2 |
+| 1 | below average | 30 | 4,200 | 4,045 | 0.2 |
+| 2 | middle | 50 | 5,440 | 5,240 | 0.2 |
+| 3 | above average | 70 | 7,080 | 6,819 | 0.2 |
+| 4 | busy | 90 | 9,762 | 9,403 | 0.2 |
+
+(In calls: 134 / 210 / 272 / 354 / 488.)
 
 **Demand table** (`DayForecast.demand_neighbourhood`, built by `neighbourhood_demand()` in
 [scenarios.py](../src/heattents/models/scenarios.py)):
@@ -67,17 +76,18 @@ $$
 | `uhf` | UHF42 neighbourhood code (e.g. `306` = Chelsea – Clinton) |
 | `scenario` | 0–4, as in the scenario table |
 | `probability` | 0.2 |
-| `expected_cases` | Expected heat EMS calls with a known location in that neighbourhood that day, in that scenario |
+| `expected_cases` | Expected **people needing help** (calls with a known location × 20) in that neighbourhood that day, in that scenario |
 
-Example rows for Chelsea – Clinton (share 7.8%): 10.1 / 15.8 / 20.5 / 26.7 / 36.8 expected calls in scenarios 0–4.
+Example rows for Chelsea – Clinton (share 7.8%): 202 / 316 / 410 / 534 / 736 expected people in scenarios 0–4
+(10.1 / 15.8 / 20.5 / 26.7 / 36.8 calls × 20).
 In every scenario the 42 rows sum to that scenario's `located_total`.
 
 **Neighbourhood summary** (`DayForecast.neighbourhoods`, for maps and reports): one row per neighbourhood with name,
 borough, today's share, usual share, change against a usual day, expected calls, 90% range of calls, probability of
 at least one call, and observed calls for past dates.
 
-**Units:** expected **EMS heat calls** (the label), not all heat illness. Calls without a usable location (about 4%) are
-in the city total but not in any neighbourhood.
+**Units:** people needing help = EMS heat calls × 20. Calls without a usable location (about 4%) are in the city total
+but not in any neighbourhood. Shares and probabilities (e.g. P(≥ 50 calls)) are unchanged and still refer to calls.
 
 **How to get it:** `ForecastService().forecast_date("2026-07-02")` for a past date (forecast as issued the evening
 before), or `ForecastService().simulate(...)` for a what-if day. Both return a `DayForecast` with `scenarios` and

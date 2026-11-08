@@ -166,7 +166,7 @@ $$
 - $N^s$ are the **10th, 30th, 50th, 70th and 90th percentiles** of the city model's predictive distribution: five equally likely versions of tomorrow, from quiet to busy. Each stands for one fifth of the distribution.
 - $m$ is the share of calls with a known location (0.96).
 - $\pi_u$ is the neighbourhood's share: the share model's 177 ZIP-area shares summed to the 42 UHF neighbourhoods.
-- The output is **daily** (no hourly split) and always has exactly 5 scenarios. Columns: `uhf, scenario, probability, expected_cases`.
+- The output is **daily** (no hourly split), always has exactly 5 scenarios, and is in **people needing help = calls × 20** (converted once, right after the forecast). Columns: `uhf, scenario, probability, expected_cases`.
 
 Full specification with an example: [docs/forecast_model.md § Output](docs/forecast_model.md#output-what-the-forecast-hands-to-the-optimiser).
 

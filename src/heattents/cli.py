@@ -6,6 +6,7 @@ Steps, in pipeline order (``all`` runs ingest -> features -> city -> area):
     eda        exploratory analysis of the label (outputs/eda)
     city       citywide model: 2024-26 season-by-season test, final model, heat curve and effects (outputs/models/city)
     area       beach & event share model: rolling-origin evaluation + final model (outputs/models/share)
+    export     static JSON/GeoJSON result bundle for a front-end: forecasts + precomputed Gurobi plans (outputs/ui)
     app        print how to start the Streamlit decision-support app
 """
 from __future__ import annotations
@@ -15,7 +16,7 @@ import time
 
 from .config import PATHS
 
-STEPS = ["ingest", "features", "eda", "city", "area", "app"]
+STEPS = ["ingest", "features", "eda", "city", "area", "export", "app"]
 
 
 def ingest(refresh: bool = False):
@@ -60,6 +61,9 @@ def main(argv=None):
         elif step == "area":
             from .models import context_share
             context_share.run(PATHS)
+        elif step == "export":
+            from . import export
+            export.run(PATHS)
         elif step == "app":
             print("Start the decision-support app with:\n    .venv/bin/streamlit run app/streamlit_app.py")
         print(f"=== {step} done in {time.time() - t0:.0f}s")

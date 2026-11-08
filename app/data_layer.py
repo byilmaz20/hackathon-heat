@@ -1,19 +1,15 @@
-"""Single data-access layer of the app.
+"""Single data-access layer of the app (real data and trained models only). All counts are PEOPLE needing help
+(EMS heat calls x 20, converted once by heattents.service right after the forecast).
 
-get_forecast(scenario)   -> heattents.service.DayForecast from the trained models: citywide predictive distribution
-                            (DLNM-NB / LightGBM ensemble, forecast-error Monte Carlo), area shares (beach & event share model),
-                            hour profile, and coherent demand scenarios for the optimiser.
-candidate_sites(...)     -> NYC Parks properties screened by reachable demand (or Cool It! NYC sites).
-solver_backend()         -> heattents.deploy.milp (Gurobi) if importable, else app/mock.py (greedy).
-
-MOCK mode (app/mock_data.py + app/mock.py): synthetic geography, forecasts and sites with the same shapes, so the UI
-runs with no data, no trained models and no Gurobi licence. HEAT_MOCK=1 forces it, HEAT_MOCK=0 forces the real
-pipeline; unset, it is used whenever the trained share model is missing.
+get_forecast(scenario)   -> heattents.service.DayForecast for a historical date: citywide predictive distribution
+                            (DLNM-NB / LightGBM ensemble, forecast-error Monte Carlo), shares from the beach & event
+                            share model, and the 42-neighbourhood x 5-scenario daily demand.
+plan_hospitals(fc, n)    -> heattents.deploy.daily plan: where to place n field hospitals (cooling tents) and how
+                            to staff them, from that day's forecast (15-minute walk, sites per RULES: parks or anywhere, Gurobi).
+city history             -> out-of-sample citywide forecasts vs observed around a date.
 """
 from __future__ import annotations
 
-import dataclasses
-import os
 import sys
 from dataclasses import dataclass
 from functools import lru_cache
@@ -24,67 +20,38 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from heattents.ingest import geography  # noqa: E402
-import mock_data  # noqa: E402
 
-RAW = ROOT / "data" / "raw"
-_MOCK_ENV = os.environ.get("HEAT_MOCK", "auto").strip().lower()
-MOCK = _MOCK_ENV in ("1", "true", "yes") or (
-    _MOCK_ENV == "auto" and not (ROOT / "outputs" / "models" / "share" / "share_model.pkl").exists())
-DATA_SOURCE = ("MOCK data: synthetic geography, forecasts and sites (app/mock_data.py)" if MOCK
-               else "Trained models (heattents.service)")
+WORKERS_PER_HOSPITAL = 4
+from heattents.service import PEOPLE_PER_CALL  # noqa: E402  (forecast output is in people = calls x 20)
+
+# Planning rules. Switch ACTIVE_RULES to "previous" to go back to the earlier behaviour.
+RULES = {
+    "previous": dict(activation_calls=0.0, min_calls_per_hospital=0.0, max_per_neighbourhood=1, site_mode="parks",
+                     radius_km=None, unlimited_capacity=False),
+    "threshold": dict(activation_calls=0.0,  # (was 20: deploy only if the city forecast expects >= 20 heat calls)
+                      min_calls_per_hospital=0.0,  # (was 3: each open hospital serves >= 3 calls' worth of people)
+                      max_per_neighbourhood=3,  # up to 3 hospitals in the same neighbourhood
+                      site_mode="anywhere",  # hospitals anywhere on land (400 m grid), not only parks and plazas
+                      radius_km=2.0,  # reach: everyone within 2 km straight-line (instead of a 15-minute walk)
+                      unlimited_capacity=True),  # a hospital helps everyone in reach; health workers are ignored
+}
+ACTIVE_RULES = "threshold"  # "previous" = exact number of hospitals, one per neighbourhood, no threshold
 
 
 @dataclass(frozen=True)
 class Scenario:
-    """A day to forecast: a historical date under an information set, or a user-specified weather scenario."""
-    label: str = "custom scenario"
-    date: str | None = None  # historical date (2024-2026) -> archived 1-day-ahead forecast issued at 18:00 the day before
-    heat_index_f: float = 100.0  # custom: max apparent temperature (heat index) in F
-    hot_days_before: int = 2  # custom: consecutive days with heat index >= 90 F before today
-    weekend: bool = False
-    holiday: bool = False
-    upstream_gradient_f: float = 0.0  # custom: yesterday's heat index in Philadelphia/Baltimore/DC minus NYC (F)
-    calls_yesterday_by18: float = 30.0  # custom: yesterday's citywide heat EMS calls before 18:00
-    event: str | None = None  # custom: recurring permitted event on the day (see heattents.models.context_share.EVENTS)
+    """A historical day to forecast, as the forecast was issued at 18:00 the evening before."""
+    label: str
+    date: str
 
 
-# --- static data ----------------------------------------------------------------------------------------------
-@lru_cache(maxsize=1)
-def areas() -> pd.DataFrame:
-    if MOCK:
-        return mock_data.areas()
-    Z = geography.load_modzcta()
-    return Z.rename(columns={"modzcta": "area_id"})
-
-
-def _polygon_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per polygon part (pydeck PolygonLayer needs simple rings)."""
-    rows = []
-    for r in df.itertuples():
-        parts = list(r.geometry.geoms) if r.geometry.geom_type == "MultiPolygon" else [r.geometry]
-        for p in parts:
-            rows.append(dict(area_id=r.area_id, polygon=[list(c) for c in p.exterior.coords]))
-    return pd.DataFrame(rows)
-
-
-@lru_cache(maxsize=1)
-def area_polygons() -> pd.DataFrame:
-    return _polygon_rows(areas())
-
-
-# --- the 42 UHF neighbourhoods (the unit the app plans on) -----------------------------------------------------
+# --- the 42 UHF neighbourhoods ----------------------------------------------------------------------------------
 @lru_cache(maxsize=1)
 def neighbourhoods() -> pd.DataFrame:
     """42 UHF neighbourhoods: area_id (= uhf code as str), uhf, name, borough, lat, lon, geometry."""
-    if MOCK:
-        from shapely.ops import unary_union
-        geom = mock_data.areas().groupby("uhf").geometry.apply(lambda s: unary_union(list(s)).buffer(1e-7))
-        N = mock_data.neighbourhoods()[["uhf", "name", "borough"]].merge(geom.reset_index(), on="uhf")
-    else:
-        N = geography.load_neighbourhoods()[["uhf", "name", "borough", "geometry"]]
+    N = geography.load_neighbourhoods()[["uhf", "name", "borough", "geometry"]]
     N = N.assign(uhf=N.uhf.astype(str), area_id=N.uhf.astype(str))
     pts = [g.representative_point() for g in N.geometry]
     return N.assign(lat=[p.y for p in pts], lon=[p.x for p in pts])[
@@ -93,75 +60,59 @@ def neighbourhoods() -> pd.DataFrame:
 
 @lru_cache(maxsize=1)
 def neighbourhood_polygons() -> pd.DataFrame:
-    return _polygon_rows(neighbourhoods())
-
-
-def _interior_points(geom, k: int) -> list[tuple[float, float]]:
-    """Up to k well-spread (lat, lon) points inside a polygon (thinned grid), always at least one."""
-    from shapely.geometry import Point
-    minx, miny, maxx, maxy = geom.bounds
-    grid = [Point(x, y) for x in np.linspace(minx, maxx, 12) for y in np.linspace(miny, maxy, 12)]
-    inside = [p for p in grid if geom.contains(p)] or [geom.representative_point()]
-    idx = sorted(set(np.linspace(0, len(inside) - 1, min(k, len(inside))).round().astype(int)))
-    return [(inside[i].y, inside[i].x) for i in idx]
-
-
-@lru_cache(maxsize=4)
-def neighbourhood_points(points_per_neighbourhood: int = 10) -> pd.DataFrame:
-    """Demand points: each neighbourhood's demand is spread evenly over points inside it (area_id = 'uhf#j')."""
+    """One row per polygon part (pydeck PolygonLayer needs simple rings)."""
     rows = []
     for r in neighbourhoods().itertuples():
-        pts = _interior_points(r.geometry, points_per_neighbourhood)
-        rows += [dict(area_id=f"{r.area_id}#{j}", uhf=r.area_id, lat=la, lon=lo, weight=1 / len(pts))
-                 for j, (la, lo) in enumerate(pts)]
+        parts = list(r.geometry.geoms) if r.geometry.geom_type == "MultiPolygon" else [r.geometry]
+        rows += [dict(area_id=r.area_id, polygon=[list(c) for c in p.exterior.coords]) for p in parts]
     return pd.DataFrame(rows)
 
 
-def neighbourhood_demand(fc) -> pd.DataFrame:
-    """Optimiser input from THE prediction output (fc.demand_neighbourhood: 42 neighbourhoods x 5 scenarios, daily):
-    split into hours with the forecast's citywide hour profile and spread over points inside each neighbourhood.
-    Columns: area_id ('uhf#j'), lat, lon, hour, scenario, expected_cases."""
-    D = fc.demand_neighbourhood.assign(uhf=lambda d: d.uhf.astype(str))[["uhf", "scenario", "expected_cases"]]
-    prof = fc.demand.groupby("hour").expected_cases.sum().reindex(range(24), fill_value=0.0)
-    prof = (prof / prof.sum()).rename("frac").reset_index()
-    out = D.merge(neighbourhood_points(), on="uhf").merge(prof, how="cross")
-    out["expected_cases"] = out.expected_cases * out.weight * out.frac
-    return out[["area_id", "lat", "lon", "hour", "scenario", "expected_cases"]]
-
-
-# --- forecasts (real models via heattents.service) --------------------------------------------------------------
+# --- forecasts --------------------------------------------------------------------------------------------------
 @lru_cache(maxsize=1)
 def service():
     from heattents.service import ForecastService
     return ForecastService()
 
 
-def f_to_c(f: float) -> float:
-    return (f - 32) * 5 / 9
-
-
 def get_forecast(sc: Scenario, seed: int = 0):
-    """DayForecast: city predictive summary + samples, per-area map values, and Gurobi demand scenarios."""
-    if MOCK:
-        return mock_data.forecast(sc, seed=seed)
-    svc = service()
-    if sc.date is not None:
-        return svc.forecast_date(sc.date, seed=seed)
-    d = pd.Timestamp("2026-07-15")
-    return svc.simulate(seed=seed, atmax=f_to_c(sc.heat_index_f),
-                        hot_days_before=int(sc.hot_days_before), season_hot_days_before=max(int(sc.hot_days_before), 8),
-                        weekend=int(sc.weekend), holiday=int(sc.holiday), up_sw_gradient=sc.upstream_gradient_f * 5 / 9,
-                        calls_by18=float(sc.calls_yesterday_by18), event=sc.event, year=2026, day_of_year=int(d.day_of_year), date=d)
+    """DayForecast for a historical date (forecast as issued at 18:00 the evening before)."""
+    return service().forecast_date(sc.date, seed=seed)
 
 
+def neighbourhood_forecast(fc) -> pd.DataFrame:
+    """Per neighbourhood: area_id, expected calls, 90% range and observed calls (past dates)."""
+    nb = fc.neighbourhoods.assign(area_id=fc.neighbourhoods.uhf.astype(str))
+    cols = ["area_id", "expected", "q05", "q95"] + (["observed"] if "observed" in nb else [])
+    return nb[cols]
+
+
+# --- field hospitals (daily MILP) -------------------------------------------------------------------------------
+def deployment_needed(fc, rules: str = ACTIVE_RULES) -> bool:
+    """Activation threshold: deploy only if the city forecast expects at least RULES[rules]['activation_calls']."""
+    return float(fc.city["mean"]) / fc.people_per_call >= RULES[rules]["activation_calls"]  # threshold is in calls
+
+
+def plan_hospitals(fc, n_hospitals: int, workers_per_hospital: int = WORKERS_PER_HOSPITAL, rules: str = ACTIVE_RULES):
+    """deploy.daily plan for the day: up to n field hospitals, workers_per_hospital x n health workers in total,
+    under the planning rules RULES[rules]. None when the activation threshold is not reached."""
+    from heattents.deploy.daily import solve, walking_request
+    r = RULES[rules]
+    if not deployment_needed(fc, rules):
+        return None
+    return solve(walking_request(fc, int(n_hospitals), int(n_hospitals) * int(workers_per_hospital),
+                                 max_per_neighbourhood=r["max_per_neighbourhood"],
+                                 min_calls_per_hospital=r["min_calls_per_hospital"], site_mode=r["site_mode"],
+                                 radius_km=r["radius_km"], unlimited_capacity=r["unlimited_capacity"]))
+
+
+# --- history around a date ----------------------------------------------------------------------------------------
 MODEL_LABELS = {"glm": "GLM", "gbm": "GBM", "ens": "Ensemble"}
 
 
 @lru_cache(maxsize=1)
 def city_predictions() -> pd.DataFrame:
     """Out-of-sample city forecasts 2024-26: season, model (glm/gbm/ens), date, y (observed), mean, q05, q50, q95."""
-    if MOCK:
-        return mock_data.city_predictions()
     return pd.read_csv(ROOT / "outputs" / "models" / "city" / "oos_predictions.csv", parse_dates=["date"])
 
 
@@ -175,7 +126,8 @@ def city_history(date: str, days_before: int = 30, days_after: int = 7) -> pd.Da
     lo, hi = _window(date, days_before, days_after)
     P = city_predictions()
     P = P[(P.model == "ens") & P.date.between(lo, hi)]
-    return P.rename(columns={"y": "observed", "mean": "forecast"})[["date", "observed", "forecast", "q05", "q95"]]
+    P = P.rename(columns={"y": "observed", "mean": "forecast"})[["date", "observed", "forecast", "q05", "q95"]]
+    return P.assign(**{c: P[c] * PEOPLE_PER_CALL for c in ["observed", "forecast", "q05", "q95"]})  # in people
 
 
 def city_models_history(date: str, days_before: int = 30, days_after: int = 7) -> pd.DataFrame:
@@ -185,120 +137,68 @@ def city_models_history(date: str, days_before: int = 30, days_after: int = 7) -
     P = P[P.date.between(lo, hi)]
     models = P.assign(series=P.model.map(MODEL_LABELS), calls=P["mean"])[["date", "series", "calls"]]
     actual = P[P.model == "ens"].assign(series="Actual", calls=lambda d: d.y)[["date", "series", "calls"]]
-    return pd.concat([models, actual], ignore_index=True)
+    out = pd.concat([models, actual], ignore_index=True)
+    return out.assign(calls=out.calls * PEOPLE_PER_CALL)  # in people (column name kept for the chart)
 
 
-@lru_cache(maxsize=64)
-def neighbourhood_history(uhf: str, date: str, days_before: int = 30, days_after: int = 7) -> pd.DataFrame:
-    """Ensemble forecast vs observed calls for one neighbourhood around a date: date, observed, forecast, q05, q95.
-    Real pipeline: one forecast per day (slow the first time, then cached)."""
-    lo, hi = _window(date, days_before, days_after)
-    if MOCK:
-        return mock_data.neighbourhood_history(uhf, lo, hi)
-    rows = []
-    for d in pd.date_range(lo, hi):
-        try:
-            nb = service().forecast_date(str(d.date())).neighbourhoods
-        except Exception:  # outside the panel / no forecast for that day
-            continue
-        r = nb[nb.uhf.astype(str) == str(uhf)].iloc[0]
-        rows.append(dict(date=d, observed=r.get("observed", np.nan), forecast=r.expected, q05=r.q05, q95=r.q95))
-    return pd.DataFrame(rows, columns=["date", "observed", "forecast", "q05", "q95"])
+# --- slide tabs (precomputed by app/precompute.py) ------------------------------------------------------------------
+APP_OUT = ROOT / "outputs" / "app"
+COVERAGE_OUT = ROOT / "outputs" / "models" / "deploy_compare" / "coverage"
 
 
-def area_of(area_id: pd.Series) -> pd.Series:
-    return area_id.astype(str).str.split("#").str[0]
+@lru_cache(maxsize=1)
+def city_accuracy() -> dict:
+    """Out-of-sample accuracy of the citywide ensemble, 2024-26, in people."""
+    E = city_predictions()
+    E = E[E.model == "ens"]
+    err = (E.y - E["mean"]).abs() * PEOPLE_PER_CALL
+    top = E.nlargest(8, "y")
+    return dict(days=len(E), median_error=float(err.median()), mean_error=float(err.mean()),
+                correlation=float(np.corrcoef(E.y, E["mean"])[0, 1]),
+                in_range_pct=float(100 * ((E.y >= E.q05) & (E.y <= E.q95)).mean()),
+                busiest_error={MODEL_LABELS[m]: float(PEOPLE_PER_CALL * (g.set_index("date").loc[top.date, "mean"]
+                                                                         - top.set_index("date").y).abs().mean())
+                               for m, g in city_predictions().groupby("model")})
 
 
-def _poisson_sf(k: int, lam: np.ndarray) -> np.ndarray:
-    """P(N >= k) for N ~ Poisson(lam)."""
-    if k <= 0:
-        return np.ones_like(lam)
-    term, cdf = np.exp(-lam), np.exp(-lam)
-    for j in range(1, k):
-        term = term * lam / j
-        cdf = cdf + term
-    return 1 - cdf
+@lru_cache(maxsize=1)
+def input_correlations() -> pd.DataFrame:
+    """label, correlation of each main input with daily citywide calls (May-Sep 2005-2026)."""
+    return pd.read_csv(APP_OUT / "input_correlations.csv")
 
 
-def summarise(demand: pd.DataFrame, hours: list[int], k: int = 1, seed: int = 1) -> pd.DataFrame:
-    """Per-area expected cases in an hour band, 90% band and P(cases >= k), mixing over forecast scenarios."""
-    rng = np.random.default_rng(seed)
-    d = demand[demand.hour.isin(hours)].assign(area_id=lambda x: area_of(x.area_id))
-    band = d.groupby(["area_id", "scenario"]).expected_cases.sum().unstack("scenario").fillna(0)
-    lam = band.to_numpy()
-    counts = rng.poisson(lam[:, :, None], size=lam.shape + (50,)).reshape(lam.shape[0], -1)
-    return pd.DataFrame({"area_id": band.index, "expected": lam.mean(1), "q05": np.quantile(counts, 0.05, axis=1),
-                         "q95": np.quantile(counts, 0.95, axis=1), f"p_ge_{k}": _poisson_sf(k, lam).mean(1)})
+def oos_2026(uhf: str | None = None) -> pd.DataFrame:
+    """2026 forecast (models trained on 2005-2025) vs observed, in people: date, observed, forecast[, q05, q95]."""
+    if uhf is None:
+        P = city_predictions()
+        P = P[(P.model == "ens") & (P.season == 2026)].rename(columns={"y": "observed", "mean": "forecast"})
+        P = P[["date", "observed", "forecast", "q05", "q95"]]
+        return P.assign(**{c: P[c] * PEOPLE_PER_CALL for c in ["observed", "forecast", "q05", "q95"]})
+    N = _oos_2026_neighbourhoods()
+    return N[N.uhf == str(uhf)].rename(columns={"expected": "forecast"})[["date", "observed", "forecast"]]
 
 
-# --- candidate sites ------------------------------------------------------------------------------------------
-def candidate_sites(source: str, demand: pd.DataFrame, radius_km: float = 1.0, top_n: int = 250) -> pd.DataFrame:
-    if MOCK:
-        return mock_data.candidate_sites(source, demand, radius_km, top_n)
-    if source == "Cool It! NYC cooling sites":
-        c = pd.read_csv(RAW / "nyc_cool_it_sites_2020.csv")
-        c = c[c.status.str.lower().eq("activated")]
-        g = c.groupby("propertyname").agg(lat=("lat", "mean"), lon=("lon", "mean"), kind=("featuretype", "first"),
-                                          borough=("borough", "first")).reset_index()
-        g["site_id"] = ["CS%03d" % i for i in range(len(g))]
-        return g.rename(columns={"propertyname": "name"})[["site_id", "name", "lat", "lon", "kind", "borough"]]
-    from heattents.deploy.candidates import park_points, screen
-    return screen(park_points(), demand, radius_km, top_n)
+@lru_cache(maxsize=1)
+def _oos_2026_neighbourhoods() -> pd.DataFrame:
+    return pd.read_csv(APP_OUT / "oos_2026_neighbourhoods.csv", parse_dates=["date"], dtype={"uhf": str})
 
 
-# --- solver ---------------------------------------------------------------------------------------------------
-def solver_backend():
-    """(module, label): the Gurobi model when available, else the greedy mock with the same interface."""
-    if MOCK:
-        import mock as backend
-        return backend, "MOCK greedy heuristic (app/mock.py) - not optimal"
-    try:
-        from heattents.deploy import milp as backend  # written by the optimisation work stream
-        return backend, "Gurobi MILP (heattents.deploy.milp)"
-    except Exception:
-        import mock as backend
-        return backend, "MOCK greedy heuristic (app/mock.py) - not optimal"
+@lru_cache(maxsize=1)
+def coverage_results() -> pd.DataFrame:
+    """date, plan, needed, helped, helped_pct (people) under the active rules (deploy.compare.run_coverage)."""
+    return pd.read_csv(COVERAGE_OUT / "daily_results.csv")
 
 
-def _build(cls, **kw):
-    names = {f.name for f in dataclasses.fields(cls)}
-    return cls(**{k: v for k, v in kw.items() if k in names})
+@lru_cache(maxsize=1)
+def coverage_sites() -> pd.DataFrame:
+    """date, plan, name, lat, lon of every compared plan."""
+    return pd.read_csv(COVERAGE_OUT / "sites.csv")
 
 
-def run_solver(n_tents, sites: pd.DataFrame, doctors: pd.DataFrame, shifts: pd.DataFrame, demand: pd.DataFrame,
-               **params):
-    backend, label = solver_backend()
-    shift_objs = [_build(backend.Shift, name=r.name, start_hour=int(r.start_hour), end_hour=int(r.end_hour))
-                  for r in shifts.itertuples()]
-    doc_objs = [_build(backend.Doctor, doctor_id=str(r.doctor_id),
-                       available_shifts=[s.strip() for s in str(r.available_shifts).split(",") if s.strip()],
-                       max_shifts=int(r.max_shifts)) for r in doctors.itertuples()]
-    site_objs = [_build(backend.Site, site_id=r.site_id, name=r.name, lat=float(r.lat), lon=float(r.lon),
-                        max_doctors=int(params.get("max_doctors_per_tent", 4)), kind=r.kind) for r in sites.itertuples()]
-    req = _build(backend.DeploymentRequest, n_tents=int(n_tents), sites=site_objs, doctors=doc_objs,
-                 shifts=shift_objs, demand=demand, **params)
-    return normalise_plan(backend.solve(req), sites, shifts), label
-
-
-def normalise_plan(plan, sites: pd.DataFrame, shifts: pd.DataFrame):
-    """Give the app one plan shape whichever backend produced it (Gurobi or mock)."""
-    O = plan.open_sites.copy()
-    if "doctors_total" not in O:
-        doc_cols = [c for c in O.columns if c.startswith("doctors_")]
-        O["doctors_total"] = O[doc_cols].sum(axis=1) if doc_cols else 0
-    A = plan.assignments.copy()
-    if "site_name" not in A and len(A):
-        A = A.merge(sites[["site_id", "name"]].rename(columns={"name": "site_name"}), on="site_id", how="left")
-    if "start_hour" not in A and len(A):
-        A = A.merge(shifts.rename(columns={"name": "shift"}), on="shift", how="left")
-    S = plan.served.rename(columns={"expected_demand": "expected_cases"})
-    if "area_id" in S:
-        S = S.assign(area_id=area_of(S.area_id))
-    k = dict(plan.kpis)
-    k.setdefault("pct_served", k.get("served_pct", np.nan))
-    k.setdefault("expected_treated", k.get("expected_served", np.nan))
-    k.setdefault("treated_pct", k.get("pct_served", np.nan))
-    k.setdefault("doctors_assigned", k.get("doctors_used", len(A)))
-    plan.open_sites, plan.assignments, plan.served, plan.kpis = O, A, S, k
-    return plan
+@lru_cache(maxsize=8)
+def observed_neighbourhoods(date: str) -> pd.DataFrame:
+    """area_id, observed people needing help per neighbourhood on a date."""
+    P = pd.read_parquet(ROOT / "data" / "processed" / "panel.parquet", columns=["modzcta", "date", "y"],
+                        filters=[("date", "==", pd.Timestamp(date))])
+    nb = P.modzcta.map(geography.modzcta_to_neighbourhood()).astype(str)
+    return (P.y * PEOPLE_PER_CALL).groupby(nb).sum().rename("observed").rename_axis("area_id").reset_index()
