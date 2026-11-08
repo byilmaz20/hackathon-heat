@@ -12,3 +12,8 @@ __pycache__/
 data/
 archive/
 outputs/
+
+# UI work in progress (kept local for now)
+docs/htmls/
+docs/artifacts_to_use.md
+src/heattents/export.py
