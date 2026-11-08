@@ -5,10 +5,15 @@ get_forecast(scenario)   -> heattents.service.DayForecast from the trained model
                             hour profile, and coherent demand scenarios for the optimiser.
 candidate_sites(...)     -> NYC Parks properties screened by reachable demand (or Cool It! NYC sites).
 solver_backend()         -> heattents.deploy.milp (Gurobi) if importable, else app/mock.py (greedy).
+
+MOCK mode (app/mock_data.py + app/mock.py): synthetic geography, forecasts and sites with the same shapes, so the UI
+runs with no data, no trained models and no Gurobi licence. HEAT_MOCK=1 forces it, HEAT_MOCK=0 forces the real
+pipeline; unset, it is used whenever the trained share model is missing.
 """
 from __future__ import annotations
 
 import dataclasses
+import os
 import sys
 from dataclasses import dataclass
 from functools import lru_cache
@@ -22,8 +27,14 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from heattents.ingest import geography  # noqa: E402
+import mock_data  # noqa: E402
 
 RAW = ROOT / "data" / "raw"
+_MOCK_ENV = os.environ.get("HEAT_MOCK", "auto").strip().lower()
+MOCK = _MOCK_ENV in ("1", "true", "yes") or (
+    _MOCK_ENV == "auto" and not (ROOT / "outputs" / "models" / "share" / "share_model.pkl").exists())
+DATA_SOURCE = ("MOCK data: synthetic geography, forecasts and sites (app/mock_data.py)" if MOCK
+               else "Trained models (heattents.service)")
 
 
 @dataclass(frozen=True)
@@ -43,19 +54,79 @@ class Scenario:
 # --- static data ----------------------------------------------------------------------------------------------
 @lru_cache(maxsize=1)
 def areas() -> pd.DataFrame:
+    if MOCK:
+        return mock_data.areas()
     Z = geography.load_modzcta()
     return Z.rename(columns={"modzcta": "area_id"})
 
 
-@lru_cache(maxsize=1)
-def area_polygons() -> pd.DataFrame:
+def _polygon_rows(df: pd.DataFrame) -> pd.DataFrame:
     """One row per polygon part (pydeck PolygonLayer needs simple rings)."""
     rows = []
-    for r in areas().itertuples():
+    for r in df.itertuples():
         parts = list(r.geometry.geoms) if r.geometry.geom_type == "MultiPolygon" else [r.geometry]
         for p in parts:
             rows.append(dict(area_id=r.area_id, polygon=[list(c) for c in p.exterior.coords]))
     return pd.DataFrame(rows)
+
+
+@lru_cache(maxsize=1)
+def area_polygons() -> pd.DataFrame:
+    return _polygon_rows(areas())
+
+
+# --- the 42 UHF neighbourhoods (the unit the app plans on) -----------------------------------------------------
+@lru_cache(maxsize=1)
+def neighbourhoods() -> pd.DataFrame:
+    """42 UHF neighbourhoods: area_id (= uhf code as str), uhf, name, borough, lat, lon, geometry."""
+    if MOCK:
+        from shapely.ops import unary_union
+        geom = mock_data.areas().groupby("uhf").geometry.apply(lambda s: unary_union(list(s)).buffer(1e-7))
+        N = mock_data.neighbourhoods()[["uhf", "name", "borough"]].merge(geom.reset_index(), on="uhf")
+    else:
+        N = geography.load_neighbourhoods()[["uhf", "name", "borough", "geometry"]]
+    N = N.assign(uhf=N.uhf.astype(str), area_id=N.uhf.astype(str))
+    pts = [g.representative_point() for g in N.geometry]
+    return N.assign(lat=[p.y for p in pts], lon=[p.x for p in pts])[
+        ["area_id", "uhf", "name", "borough", "lat", "lon", "geometry"]]
+
+
+@lru_cache(maxsize=1)
+def neighbourhood_polygons() -> pd.DataFrame:
+    return _polygon_rows(neighbourhoods())
+
+
+def _interior_points(geom, k: int) -> list[tuple[float, float]]:
+    """Up to k well-spread (lat, lon) points inside a polygon (thinned grid), always at least one."""
+    from shapely.geometry import Point
+    minx, miny, maxx, maxy = geom.bounds
+    grid = [Point(x, y) for x in np.linspace(minx, maxx, 12) for y in np.linspace(miny, maxy, 12)]
+    inside = [p for p in grid if geom.contains(p)] or [geom.representative_point()]
+    idx = sorted(set(np.linspace(0, len(inside) - 1, min(k, len(inside))).round().astype(int)))
+    return [(inside[i].y, inside[i].x) for i in idx]
+
+
+@lru_cache(maxsize=4)
+def neighbourhood_points(points_per_neighbourhood: int = 10) -> pd.DataFrame:
+    """Demand points: each neighbourhood's demand is spread evenly over points inside it (area_id = 'uhf#j')."""
+    rows = []
+    for r in neighbourhoods().itertuples():
+        pts = _interior_points(r.geometry, points_per_neighbourhood)
+        rows += [dict(area_id=f"{r.area_id}#{j}", uhf=r.area_id, lat=la, lon=lo, weight=1 / len(pts))
+                 for j, (la, lo) in enumerate(pts)]
+    return pd.DataFrame(rows)
+
+
+def neighbourhood_demand(fc) -> pd.DataFrame:
+    """Optimiser input from THE prediction output (fc.demand_neighbourhood: 42 neighbourhoods x 5 scenarios, daily):
+    split into hours with the forecast's citywide hour profile and spread over points inside each neighbourhood.
+    Columns: area_id ('uhf#j'), lat, lon, hour, scenario, expected_cases."""
+    D = fc.demand_neighbourhood.assign(uhf=lambda d: d.uhf.astype(str))[["uhf", "scenario", "expected_cases"]]
+    prof = fc.demand.groupby("hour").expected_cases.sum().reindex(range(24), fill_value=0.0)
+    prof = (prof / prof.sum()).rename("frac").reset_index()
+    out = D.merge(neighbourhood_points(), on="uhf").merge(prof, how="cross")
+    out["expected_cases"] = out.expected_cases * out.weight * out.frac
+    return out[["area_id", "lat", "lon", "hour", "scenario", "expected_cases"]]
 
 
 # --- forecasts (real models via heattents.service) --------------------------------------------------------------
@@ -71,6 +142,8 @@ def f_to_c(f: float) -> float:
 
 def get_forecast(sc: Scenario, seed: int = 0):
     """DayForecast: city predictive summary + samples, per-area map values, and Gurobi demand scenarios."""
+    if MOCK:
+        return mock_data.forecast(sc, seed=seed)
     svc = service()
     if sc.date is not None:
         return svc.forecast_date(sc.date, seed=seed)
@@ -79,6 +152,58 @@ def get_forecast(sc: Scenario, seed: int = 0):
                         hot_days_before=int(sc.hot_days_before), season_hot_days_before=max(int(sc.hot_days_before), 8),
                         weekend=int(sc.weekend), holiday=int(sc.holiday), up_sw_gradient=sc.upstream_gradient_f * 5 / 9,
                         calls_by18=float(sc.calls_yesterday_by18), event=sc.event, year=2026, day_of_year=int(d.day_of_year), date=d)
+
+
+MODEL_LABELS = {"glm": "GLM", "gbm": "GBM", "ens": "Ensemble"}
+
+
+@lru_cache(maxsize=1)
+def city_predictions() -> pd.DataFrame:
+    """Out-of-sample city forecasts 2024-26: season, model (glm/gbm/ens), date, y (observed), mean, q05, q50, q95."""
+    if MOCK:
+        return mock_data.city_predictions()
+    return pd.read_csv(ROOT / "outputs" / "models" / "city" / "oos_predictions.csv", parse_dates=["date"])
+
+
+def _window(date: str, days_before: int, days_after: int) -> tuple[pd.Timestamp, pd.Timestamp]:
+    d = pd.Timestamp(date)
+    return d - pd.Timedelta(days=days_before), d + pd.Timedelta(days=days_after)
+
+
+def city_history(date: str, days_before: int = 30, days_after: int = 7) -> pd.DataFrame:
+    """Ensemble forecast vs observed citywide calls around a date: date, observed, forecast, q05, q95."""
+    lo, hi = _window(date, days_before, days_after)
+    P = city_predictions()
+    P = P[(P.model == "ens") & P.date.between(lo, hi)]
+    return P.rename(columns={"y": "observed", "mean": "forecast"})[["date", "observed", "forecast", "q05", "q95"]]
+
+
+def city_models_history(date: str, days_before: int = 30, days_after: int = 7) -> pd.DataFrame:
+    """Citywide calls around a date, long format: date, series (GLM/GBM/Ensemble/Actual), calls."""
+    lo, hi = _window(date, days_before, days_after)
+    P = city_predictions()
+    P = P[P.date.between(lo, hi)]
+    models = P.assign(series=P.model.map(MODEL_LABELS), calls=P["mean"])[["date", "series", "calls"]]
+    actual = P[P.model == "ens"].assign(series="Actual", calls=lambda d: d.y)[["date", "series", "calls"]]
+    return pd.concat([models, actual], ignore_index=True)
+
+
+@lru_cache(maxsize=64)
+def neighbourhood_history(uhf: str, date: str, days_before: int = 30, days_after: int = 7) -> pd.DataFrame:
+    """Ensemble forecast vs observed calls for one neighbourhood around a date: date, observed, forecast, q05, q95.
+    Real pipeline: one forecast per day (slow the first time, then cached)."""
+    lo, hi = _window(date, days_before, days_after)
+    if MOCK:
+        return mock_data.neighbourhood_history(uhf, lo, hi)
+    rows = []
+    for d in pd.date_range(lo, hi):
+        try:
+            nb = service().forecast_date(str(d.date())).neighbourhoods
+        except Exception:  # outside the panel / no forecast for that day
+            continue
+        r = nb[nb.uhf.astype(str) == str(uhf)].iloc[0]
+        rows.append(dict(date=d, observed=r.get("observed", np.nan), forecast=r.expected, q05=r.q05, q95=r.q95))
+    return pd.DataFrame(rows, columns=["date", "observed", "forecast", "q05", "q95"])
 
 
 def area_of(area_id: pd.Series) -> pd.Series:
@@ -109,6 +234,8 @@ def summarise(demand: pd.DataFrame, hours: list[int], k: int = 1, seed: int = 1)
 
 # --- candidate sites ------------------------------------------------------------------------------------------
 def candidate_sites(source: str, demand: pd.DataFrame, radius_km: float = 1.0, top_n: int = 250) -> pd.DataFrame:
+    if MOCK:
+        return mock_data.candidate_sites(source, demand, radius_km, top_n)
     if source == "Cool It! NYC cooling sites":
         c = pd.read_csv(RAW / "nyc_cool_it_sites_2020.csv")
         c = c[c.status.str.lower().eq("activated")]
@@ -123,6 +250,9 @@ def candidate_sites(source: str, demand: pd.DataFrame, radius_km: float = 1.0, t
 # --- solver ---------------------------------------------------------------------------------------------------
 def solver_backend():
     """(module, label): the Gurobi model when available, else the greedy mock with the same interface."""
+    if MOCK:
+        import mock as backend
+        return backend, "MOCK greedy heuristic (app/mock.py) - not optimal"
     try:
         from heattents.deploy import milp as backend  # written by the optimisation work stream
         return backend, "Gurobi MILP (heattents.deploy.milp)"
