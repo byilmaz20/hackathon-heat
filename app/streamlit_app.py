@@ -63,7 +63,7 @@ def cached_forecast(sc: dl.Scenario):
     return dl.get_forecast(sc)
 
 
-@st.cache_data(show_spinner="Placing field hospitals with Gurobi...")
+@st.cache_data(show_spinner=False)
 def cached_plan(sc: dl.Scenario, n_hospitals: int):
     return dl.plan_hospitals(cached_forecast(sc), n_hospitals)
 
@@ -203,24 +203,44 @@ PIPELINE = r"""digraph {
   ci -> glm; ci -> gbm; glm -> ens; gbm -> ens; ens -> city; city -> share; si -> share; share -> nb;
   {rank=same; city; si}
 }"""
-# every model input once: (card title, colour, [(group, [inputs])]); BOTH = inputs used by both models
+# every model input once: (card title, colour, [(group, [inputs])]); the heat calls are shown first as the main data
+CALLS = ("Heat EMS calls", "NYC 911 ambulance dispatches coded as heat illness, May–September 2005–2026, each with "
+         "date, time and ZIP code. They are what we forecast, and both models learn from them:",
+         [("City model", "calls the day before, up to 18:00"),
+          ("Share model", "each ZIP area's usual share of the calls")])
 INPUT_CARDS = [
     ("City model · how many people", MODEL_COLORS["Ensemble"], [
         ("Weather forecast for the day", ["Heat index (max)", "Max / min / mean temperature", "Humidity",
                                           "Hot night (≥ 24 °C)"]),
         ("Heat build-up", ["Heat index, past 3 days", "Hot days in a row", "Hot days so far this summer",
                            "Heat vs normal", "Heat vs past month", "Heat to the south-west (Philadelphia–DC)"]),
-        ("Calls", ["Calls the day before, up to 18:00"]),
-        ("Calendar", ["4 July", "School break", "COVID period", "Year", "Day of year"]),
+        ("Calendar", ["Weekends and holidays", "4 July", "School break", "COVID period", "Year", "Day of year"]),
     ]),
     ("Share model · where", "#e08a3c", [
-        ("Each ZIP area", ["Usual share of heat calls (since 2005)", "Beach", "Visitors (jobs + subway entries)",
-                           "Parks"]),
-        ("The day", ["Beach season", "Heat level (beach areas)", "6 event days and routes: Pride, Puerto Rican Day, "
-                     "Dominican Day, West Indian Day, Mermaid Parade, US Open"]),
+        ("Each ZIP area", ["Beach", "Visitors (jobs + subway entries)", "Parks"]),
+        ("The day", ["Weekends and holidays", "Beach season", "Heat level (beach areas)",
+                     "6 event days and routes: Pride, Puerto Rican Day, Dominican Day, West Indian Day, "
+                     "Mermaid Parade, US Open"]),
     ]),
 ]
-BOTH = ["Weekends and holidays"]
+
+
+def inputs_html() -> str:
+    chip = ("<span style='display:inline-block;padding:2px 9px;margin:2px 4px 2px 0;border-radius:11px;"
+            "background:rgba(140,140,140,.16);font-size:.8rem;line-height:1.5'>{}</span>")
+    head = "<div style='font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;opacity:.6;margin:8px 0 2px'>{}</div>"
+    title, text, uses = CALLS
+    used = "".join(f"<div style='font-size:.82rem;margin-top:2px'><b>{m}:</b> {u}</div>" for m, u in uses)
+    calls = (f"<div style='border-left:3px solid #c3c2b7;background:rgba(140,140,140,.08);border-radius:4px;"
+             f"padding:6px 12px;margin-bottom:6px'>{head.format('Main data')}"
+             f"<div style='font-weight:600;font-size:.95rem'>{title}</div>"
+             f"<div style='font-size:.82rem;opacity:.85'>{text}</div>{used}</div>")
+    cards = []
+    for t, color, groups in INPUT_CARDS:
+        body = "".join(head.format(g) + "".join(chip.format(i) for i in items) for g, items in groups)
+        cards.append(f"<div style='flex:1;min-width:0;border-left:3px solid {color};padding:2px 0 4px 12px'>"
+                     f"<div style='font-weight:600;font-size:.95rem'>{t}</div>{body}</div>")
+    return f"<div style='font-family:inherit'>{calls}<div style='display:flex;gap:22px'>{''.join(cards)}</div></div>"
 
 
 SLIDE_CHART_HEIGHT = 210
@@ -244,20 +264,6 @@ def oos_chart(H: pd.DataFrame, band: bool) -> alt.Chart:
                       alt.Tooltip("forecast:Q", title="Forecast", format=",.1f")]).add_params(hover)
     cross = alt.Chart(H).mark_rule(color="#888", strokeWidth=1).encode(x=x).transform_filter(hover)
     return alt.layer(*layers, cross, hit).properties(height=SLIDE_CHART_HEIGHT)
-
-
-def inputs_html() -> str:
-    chip = ("<span style='display:inline-block;padding:2px 9px;margin:2px 4px 2px 0;border-radius:11px;"
-            "background:rgba(140,140,140,.16);font-size:.8rem;line-height:1.5'>{}</span>")
-    head = "<div style='font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;opacity:.6;margin:8px 0 2px'>{}</div>"
-    cards = []
-    for title, color, groups in INPUT_CARDS:
-        body = "".join(head.format(g) + "".join(chip.format(i) for i in items) for g, items in groups)
-        cards.append(f"<div style='flex:1;min-width:0;border-left:3px solid {color};padding:2px 0 4px 12px'>"
-                     f"<div style='font-weight:600;font-size:.95rem'>{title}</div>{body}</div>")
-    both = (f"<div style='margin-top:10px;padding-top:6px;border-top:1px solid rgba(140,140,140,.25)'>"
-            f"{head.format('Used by both models')}{''.join(chip.format(i) for i in BOTH)}</div>")
-    return f"<div style='font-family:inherit'><div style='display:flex;gap:22px'>{''.join(cards)}</div>{both}</div>"
 
 
 def predictive_page():
@@ -326,8 +332,7 @@ def milp_page():
 
 
 PLAN_LABELS = {"population": "Population rule", "vulnerability (HVI)": "Heat-vulnerability rule",
-               "forecast + MILP": "Forecast + MILP",
-               "hindsight (upper bound)": "Best possible (hindsight)"}
+               "forecast + MILP": "Forecast + MILP", "hindsight (upper bound)": "Best possible"}
 DAY_LABELS = {"2024-06-21": "Fri 21 Jun 2024 · heatwave", "2025-06-29": "Sun 29 Jun 2025 · Pride"}
 
 
@@ -379,12 +384,10 @@ def results_page():
             st.markdown(f"**{label}** · {D.needed.iloc[0]:,.0f} people needed help")
             st.altair_chart(results_bars(D), width="stretch")
             st.pydeck_chart(results_map(date, plan), height=250, width="stretch", key=f"res_{date}")
-    st.caption("Same rules for every plan: up to 3 per neighbourhood, a hospital helps everyone within "
-               f"{dl.RULES[dl.ACTIVE_RULES]['radius_km']:g} km. Forecasts out of sample. Map colour: people who needed help.")
 
 
 sc = sidebar_scenario()
-st.title("NYC heat-illness response")
+st.title("NYC Heat-Illness Response")
 t1, t2, t3, t4 = st.tabs(["Forecast & plan", "Predictive model", "MILP model", "Results"])
 with t1:
     forecast_page(sc, cached_forecast(sc))

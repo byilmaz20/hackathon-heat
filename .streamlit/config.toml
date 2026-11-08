@@ -1,0 +1,2 @@
+[client]
+toolbarMode = "viewer"  # hides the Deploy button and developer options
